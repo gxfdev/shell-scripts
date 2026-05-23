@@ -35,6 +35,7 @@ DRY_RUN=0
 VERBOSE=0
 INTERACTIVE=1
 ROLLBACK_MODE=0
+CHECK_MODE=""
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/system_init_${TIMESTAMP}.log"
 LOCK_FILE="/tmp/system_init.lock"
@@ -1022,6 +1023,15 @@ show_usage() {
   --docker       仅安装Docker
   --devtools     仅安装开发工具
   --report       仅生成系统报告
+  --audit        仅执行安全审计
+  --hardening    仅执行CIS加固
+  --monitoring   仅安装监控代理
+  --logrotate    仅配置日志轮转
+  --selinux      仅配置SELinux/AppArmor
+  --limits       仅配置系统资源限制
+  --sysctl-check 仅检查sysctl配置
+  --network-check 仅检查网络配置
+  --firewall-check 仅检查防火墙状态
 
 控制选项:
   --dry-run          模拟运行, 不实际执行
@@ -1042,12 +1052,1094 @@ show_usage() {
   swap_file=/swapfile
   docker_mirror=https://mirrors.aliyun.com/docker-ce
   docker_registry_mirror=https://mirror.ccs.tencentyun.com
+  timezone=Asia/Shanghai
+  locale=en_US.UTF-8
 
 支持的操作系统:
   - CentOS/RHEL 7/8/9, Rocky Linux, AlmaLinux, Fedora
   - Ubuntu 18.04/20.04/22.04/24.04, Debian 10/11/12
   - Alpine Linux, Arch Linux / Manjaro, openSUSE
 USAGE
+}
+
+# ============================================================================
+# 安全审计模块
+# ============================================================================
+
+run_security_audit() {
+    log_step "执行系统安全审计..."
+    local audit_file="${LOG_DIR}/security_audit_${TIMESTAMP}.txt"
+    local score=0 total=0
+
+    echo "================================================================" > "${audit_file}"
+    echo "  系统安全审计报告 - ${TIMESTAMP}" >> "${audit_file}"
+    echo "================================================================" >> "${audit_file}"
+
+    echo -e "\n[1] 账户安全检查" >> "${audit_file}"
+    ((total++)) || true
+    local empty_pass="$(awk -F: '($2 == "" || $2 == "!") {print $1}' /etc/shadow 2>/dev/null)"
+    if [[ -z "${empty_pass}" ]]; then
+        echo "  [PASS] 无空密码账户" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 发现空密码账户: ${empty_pass}" >> "${audit_file}"
+        log_warning "发现空密码账户: ${empty_pass}"
+    fi
+
+    ((total++)) || true
+    local uid0_users="$(awk -F: '($3 == 0) {print $1}' /etc/passwd 2>/dev/null)"
+    if [[ "$(echo "${uid0_users}" | wc -l)" -le 1 ]]; then
+        echo "  [PASS] UID=0账户数正常: ${uid0_users}" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 多个UID=0账户: ${uid0_users}" >> "${audit_file}"
+        log_warning "多个UID=0账户: ${uid0_users}"
+    fi
+
+    ((total++)) || true
+    if [[ -f /etc/login.defs ]] && grep -q "PASS_MAX_DAYS.*90" /etc/login.defs 2>/dev/null; then
+        echo "  [PASS] 密码最大有效期已设置为90天" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 密码最大有效期未设置或超过90天" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    if [[ -f /etc/login.defs ]] && grep -q "PASS_MIN_LEN.*1[0-9]" /etc/login.defs 2>/dev/null; then
+        echo "  [PASS] 密码最小长度已设置为12位以上" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 密码最小长度不足12位" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    local expired_users="$(awk -F: '{if($2 !~ /^[!*]/ && $2 != "") system("chage -l "$1" 2>/dev/null | grep -q \"password must be changed\" && echo "$1")}' /etc/passwd 2>/dev/null)"
+    if [[ -z "${expired_users}" ]]; then
+        echo "  [PASS] 无密码过期账户" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [WARN] 密码已过期账户: ${expired_users}" >> "${audit_file}"
+    fi
+
+    echo -e "\n[2] SSH安全检查" >> "${audit_file}"
+    ((total++)) || true
+    if grep -q "^PermitRootLogin no" /etc/ssh/sshd_config 2>/dev/null; then
+        echo "  [PASS] 禁止Root SSH登录" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 允许Root SSH登录" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    if grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config 2>/dev/null; then
+        echo "  [PASS] 禁止密码认证" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 允许密码认证" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    if grep -q "^Protocol 2" /etc/ssh/sshd_config 2>/dev/null || ! grep -q "^Protocol 1" /etc/ssh/sshd_config 2>/dev/null; then
+        echo "  [PASS] SSH协议版本正确" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] SSH使用不安全协议版本" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    local ssh_port="$(grep -E '^Port' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')"
+    if [[ -n "${ssh_port}" ]] && [[ "${ssh_port}" != "22" ]]; then
+        echo "  [PASS] SSH端口已修改: ${ssh_port}" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [WARN] SSH使用默认端口22" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    if grep -q "^MaxAuthTries" /etc/ssh/sshd_config 2>/dev/null; then
+        local max_tries="$(grep '^MaxAuthTries' /etc/ssh/sshd_config | awk '{print $2}')"
+        if [[ ${max_tries} -le 5 ]]; then
+            echo "  [PASS] SSH最大认证尝试次数: ${max_tries}" >> "${audit_file}"; ((score++)) || true
+        else
+            echo "  [FAIL] SSH最大认证尝试次数过多: ${max_tries}" >> "${audit_file}"
+        fi
+    else
+        echo "  [WARN] 未设置SSH最大认证尝试次数" >> "${audit_file}"
+    fi
+
+    echo -e "\n[3] 文件权限检查" >> "${audit_file}"
+    local perm_checks=(
+        "/etc/passwd:644"
+        "/etc/shadow:600"
+        "/etc/group:644"
+        "/etc/gshadow:600"
+        "/etc/ssh/sshd_config:600"
+        "/etc/crontab:600"
+        "/etc/sudoers:440"
+    )
+    for check in "${perm_checks[@]}"; do
+        local file="${check%%:*}" expected="${check##*:}"
+        ((total++)) || true
+        if [[ -f "${file}" ]]; then
+            local actual="$(stat -c %a "${file}" 2>/dev/null || stat -f %Lp "${file}" 2>/dev/null)"
+            if [[ "${actual}" -le "${expected}" ]]; then
+                echo "  [PASS] ${file} 权限: ${actual} (要求<=${expected})" >> "${audit_file}"; ((score++)) || true
+            else
+                echo "  [FAIL] ${file} 权限: ${actual} (要求<=${expected})" >> "${audit_file}"
+            fi
+        fi
+    done
+
+    echo -e "\n[4] 内核安全参数检查" >> "${audit_file}"
+    local sysctl_checks=(
+        "kernel.randomize_va_space:2"
+        "kernel.kptr_restrict:2"
+        "kernel.dmesg_restrict:1"
+        "net.ipv4.conf.all.rp_filter:1"
+        "net.ipv4.conf.all.accept_source_route:0"
+        "net.ipv4.conf.all.accept_redirects:0"
+        "net.ipv4.icmp_echo_ignore_broadcasts:1"
+        "net.ipv4.tcp_syncookies:1"
+    )
+    for check in "${sysctl_checks[@]}"; do
+        local key="${check%%:*}" expected="${check##*:}"
+        ((total++)) || true
+        local actual="$(sysctl -n "${key}" 2>/dev/null || echo 'N/A')"
+        if [[ "${actual}" == "${expected}" ]]; then
+            echo "  [PASS] ${key} = ${actual}" >> "${audit_file}"; ((score++)) || true
+        else
+            echo "  [FAIL] ${key} = ${actual} (期望: ${expected})" >> "${audit_file}"
+        fi
+    done
+
+    echo -e "\n[5] 服务安全检查" >> "${audit_file}"
+    local unsafe_services=(telnet rsh rlogin vsftpd tftp xinetd inetd)
+    for svc in "${unsafe_services[@]}"; do
+        ((total++)) || true
+        if ! systemctl is-active "${svc}" &>/dev/null 2>&1; then
+            echo "  [PASS] 不安全服务 ${svc} 未运行" >> "${audit_file}"; ((score++)) || true
+        else
+            echo "  [FAIL] 不安全服务 ${svc} 正在运行" >> "${audit_file}"
+        fi
+    done
+
+    echo -e "\n[6] SUID/SGID文件检查" >> "${audit_file}"
+    local known_suids="/usr/bin/sudo /usr/bin/passwd /usr/bin/su /usr/bin/mount /usr/bin/umount /usr/bin/pkexec /usr/bin/chsh /usr/bin/chfn /usr/bin/gpasswd /usr/bin/newgrp /usr/bin/at /usr/lib/openssh/ssh-keysign /usr/lib/dbus-1.0/dbus-daemon-launch-helper"
+    local suid_files="$(find /usr -perm -4000 -type f 2>/dev/null)"
+    for suid in ${suid_files}; do
+        ((total++)) || true
+        if echo "${known_suids}" | grep -q "${suid}"; then
+            echo "  [PASS] 已知SUID: ${suid}" >> "${audit_file}"; ((score++)) || true
+        else
+            echo "  [WARN] 未知SUID: ${suid}" >> "${audit_file}"
+        fi
+    done
+
+    echo -e "\n[7] 防火墙检查" >> "${audit_file}"
+    ((total++)) || true
+    case "${OS_INFO[firewall]}" in
+        firewalld)
+            if systemctl is-active firewalld &>/dev/null; then
+                echo "  [PASS] firewalld 已启用" >> "${audit_file}"; ((score++)) || true
+            else
+                echo "  [FAIL] firewalld 未启用" >> "${audit_file}"
+            fi
+            ;;
+        ufw)
+            if ufw status 2>/dev/null | grep -q "active"; then
+                echo "  [PASS] UFW 已启用" >> "${audit_file}"; ((score++)) || true
+            else
+                echo "  [FAIL] UFW 未启用" >> "${audit_file}"
+            fi
+            ;;
+        iptables)
+            if iptables -L INPUT 2>/dev/null | grep -q "DROP\|REJECT"; then
+                echo "  [PASS] iptables 已配置" >> "${audit_file}"; ((score++)) || true
+            else
+                echo "  [FAIL] iptables 未配置" >> "${audit_file}"
+            fi
+            ;;
+    esac
+
+    echo -e "\n[8] 日志与审计检查" >> "${audit_file}"
+    ((total++)) || true
+    if systemctl is-active rsyslog &>/dev/null || systemctl is-active syslog &>/dev/null; then
+        echo "  [PASS] 系统日志服务运行中" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [FAIL] 系统日志服务未运行" >> "${audit_file}"
+    fi
+
+    ((total++)) || true
+    if command -v auditctl &>/dev/null && systemctl is-active auditd &>/dev/null; then
+        echo "  [PASS] 审计服务运行中" >> "${audit_file}"; ((score++)) || true
+    else
+        echo "  [WARN] 审计服务未运行" >> "${audit_file}"
+    fi
+
+    echo -e "\n[9] 磁盘与分区检查" >> "${audit_file}"
+    df -h | awk 'NR>1 {
+        usage = $5; gsub(/%/, "", usage)
+        if (usage + 0 > 85) print "  [FAIL] 分区 "$6" 使用率 "usage"%"
+        else print "  [PASS] 分区 "$6" 使用率 "usage"%"
+    }' >> "${audit_file}" 2>/dev/null
+
+    echo -e "\n[10] 网络安全检查" >> "${audit_file}"
+    ((total++)) || true
+    local listening_ports="$(ss -tlnp 2>/dev/null | awk 'NR>1{print $4}' | rev | cut -d: -f1 | rev | sort -n | uniq)"
+    echo "  监听端口:" >> "${audit_file}"
+    for port in ${listening_ports}; do
+        echo "    - ${port}" >> "${audit_file}"
+    done
+    echo "  [INFO] 共 $(echo "${listening_ports}" | wc -l) 个监听端口" >> "${audit_file}"
+
+    echo -e "\n================================================================" >> "${audit_file}"
+    local pct=$((score * 100 / total))
+    echo "  审计评分: ${score}/${total} (${pct}%)" >> "${audit_file}"
+    if [[ ${pct} -ge 90 ]]; then
+        echo "  安全等级: 优秀" >> "${audit_file}"
+    elif [[ ${pct} -ge 75 ]]; then
+        echo "  安全等级: 良好" >> "${audit_file}"
+    elif [[ ${pct} -ge 60 ]]; then
+        echo "  安全等级: 一般" >> "${audit_file}"
+    else
+        echo "  安全等级: 危险" >> "${audit_file}"
+    fi
+    echo "================================================================" >> "${audit_file}"
+
+    cat "${audit_file}"
+    log_success "安全审计完成, 评分: ${score}/${total} (${pct}%)"
+}
+
+# ============================================================================
+# CIS基准加固模块
+# ============================================================================
+
+apply_cis_hardening() {
+    log_step "应用CIS安全基准加固..."
+
+    log_info "[CIS 1.1] 文件系统加固..."
+    local tmp_mounts=("tmp" "var/tmp" "dev/shm")
+    for m in "${tmp_mounts[@]}"; do
+        if ! mountpoint -q "/${m}" 2>/dev/null; then
+            log_info "配置 /${m} 挂载选项..."
+            [[ ${DRY_RUN} -eq 0 ]] && {
+                grep -q "/${m}" /etc/fstab || echo "tmpfs /${m} tmpfs defaults,nodev,nosuid,noexec 0 0" >> /etc/fstab
+                mount -o remount,nodev,nosuid,noexec "/${m}" 2>/dev/null || true
+            }
+        else
+            [[ ${DRY_RUN} -eq 0 ]] && mount -o remount,nodev,nosuid,noexec "/${m}" 2>/dev/null || true
+        fi
+    done
+
+    log_info "[CIS 1.2] 配置软件源GPG检查..."
+    case "${OS_INFO[pkg_manager]}" in
+        yum)
+            backup_file "/etc/yum.conf"
+            sed -i 's/^gpgcheck=.*/gpgcheck=1/' /etc/yum.conf 2>/dev/null || true
+            ;;
+        dnf)
+            backup_file "/etc/dnf/dnf.conf"
+            sed -i 's/^gpgcheck=.*/gpgcheck=1/' /etc/dnf/dnf.conf 2>/dev/null || true
+            ;;
+        apt)
+            backup_file "/etc/apt/apt.conf.d/99security"
+            write_config "/etc/apt/apt.conf.d/99security" 'Acquire::AllowUnauthenticated "false";
+APT::Get::AllowUnauthenticated "false";'
+            ;;
+    esac
+
+    log_info "[CIS 2.1] 禁用不必要的服务..."
+    local disable_services=(
+        "avahi-daemon" "cups" "dhcpd" "slapd" "nfs" "rpcbind"
+        "bind9" "vsftpd" "apache2" "httpd" "dovecot" "smbd"
+        "squid" "snmpd" "rysnc" "talk" "telnet" "tftp"
+        "xinetd" "daytime" "time" "echo" "discard" "chargen"
+        "bluetooth" "ModemManager" "postfix"
+    )
+    [[ ${DRY_RUN} -eq 0 ]] && for svc in "${disable_services[@]}"; do
+        case "${OS_INFO[service_manager]}" in
+            systemd)
+                systemctl stop "${svc}" 2>/dev/null || true
+                systemctl disable "${svc}" 2>/dev/null || true
+                systemctl mask "${svc}" 2>/dev/null || true
+                ;;
+            openrc)
+                rc-service "${svc}" stop 2>/dev/null || true
+                rc-update del "${svc}" default 2>/dev/null || true
+                ;;
+        esac
+    done
+
+    log_info "[CIS 3.1] 网络参数加固..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        sysctl -w net.ipv4.conf.all.send_redirects=0 2>/dev/null || true
+        sysctl -w net.ipv4.conf.default.send_redirects=0 2>/dev/null || true
+        sysctl -w net.ipv4.conf.all.accept_source_route=0 2>/dev/null || true
+        sysctl -w net.ipv4.conf.default.accept_source_route=0 2>/dev/null || true
+        sysctl -w net.ipv6.conf.all.accept_ra=0 2>/dev/null || true
+        sysctl -w net.ipv6.conf.default.accept_ra=0 2>/dev/null || true
+        sysctl -w net.ipv4.conf.all.log_martians=1 2>/dev/null || true
+        sysctl -w net.ipv4.conf.default.log_martians=1 2>/dev/null || true
+    }
+
+    log_info "[CIS 4.1] 配置审计系统..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        case "${OS_INFO[pkg_manager]}" in
+            yum|dnf) "${OS_INFO[pkg_manager]}" install -y audit auditd 2>/dev/null || true ;;
+            apt)     apt-get install -y auditd 2>/dev/null || true ;;
+            pacman)  pacman -S --noconfirm audit 2>/dev/null || true ;;
+            zypper)  zypper install -y audit 2>/dev/null || true ;;
+        esac
+
+        if [[ -d /etc/audit/rules.d ]]; then
+            write_config "/etc/audit/rules.d/cis.rules" "-D
+-b 8192
+-f 1
+--backlog_wait_time 60000
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.allow -p wa -k cron
+-w /etc/cron.deny -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/cron.daily/ -p wa -k cron
+-w /etc/cron.weekly/ -p wa -k cron
+-w /etc/cron.monthly/ -p wa -k cron
+-w /etc/hosts -p wa -k network
+-w /etc/hostname -p wa -k network
+-w /etc/resolv.conf -p wa -k network
+-w /etc/sysctl.conf -p wa -k sysctl
+-w /etc/sysctl.d/ -p wa -k sysctl
+-w /etc/login.defs -p wa -k auth
+-w /etc/pam.d/ -p wa -k auth
+-w /etc/security/ -p wa -k auth
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/log/tallylog -p wa -k logins
+-a always,exit -F arch=b64 -S chmod,chown,fchmod,fchown,lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
+-a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F auid>=1000 -F auid!=4294967295 -k file_access
+-a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts
+-a always,exit -F arch=b64 -S unlink,rename,unlinkat,renameat -F auid>=1000 -F auid!=4294967295 -k file_delete
+-a always,exit -F arch=b64 -S setuid,setgid -F auid>=1000 -F auid!=4294967295 -k priv_esc
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=4294967295 -k exec
+-a always,exit -F arch=b64 -S init_module,delete_module -k modules
+"
+            systemctl enable auditd 2>/dev/null || true
+            systemctl restart auditd 2>/dev/null || true
+        fi
+    }
+
+    log_info "[CIS 5.1] 配置日志轮转..."
+    write_config "/etc/logrotate.d/cis-hardening" "/var/log/auth.log {
+    weekly
+    rotate 13
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+/var/log/syslog {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    postrotate
+        /usr/bin/systemctl reload rsyslog > /dev/null 2>&1 || true
+    endscript
+}
+/var/log/kern.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+/var/log/daemon.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}"
+
+    log_info "[CIS 5.2] 配置日志服务器..."
+    if [[ -f /etc/rsyslog.conf ]]; then
+        backup_file "/etc/rsyslog.conf"
+        grep -q "MaxMessageSize" /etc/rsyslog.conf || echo '$MaxMessageSize 64k' >> /etc/rsyslog.conf
+        [[ ${DRY_RUN} -eq 0 ]] && systemctl restart rsyslog 2>/dev/null || true
+    fi
+
+    log_info "[CIS 6.1] 配置crontab权限..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        touch /etc/cron.allow 2>/dev/null; chmod 600 /etc/cron.allow 2>/dev/null || true
+        touch /etc/at.allow 2>/dev/null; chmod 600 /etc/at.allow 2>/dev/null || true
+        rm -f /etc/cron.deny /etc/at.deny 2>/dev/null || true
+    }
+
+    log_info "[CIS 6.2] 配置SSH安全..."
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            sed -i 's/^#*LoginGraceTime.*/LoginGraceTime 60/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 4/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*MaxSessions.*/MaxSessions 4/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 0/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*HostbasedAuthentication.*/HostbasedAuthentication no/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i 's/^#*AllowTcpForwarding.*/AllowTcpForwarding no/' /etc/ssh/sshd_config 2>/dev/null || true
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        }
+    fi
+
+    log_success "CIS安全基准加固完成"
+}
+
+# ============================================================================
+# 监控代理安装模块
+# ============================================================================
+
+install_monitoring() {
+    log_step "安装监控代理..."
+    local monitor_type="${CONFIG_VALUES[monitor_type]:-node_exporter}"
+
+    case "${monitor_type}" in
+        node_exporter)
+            install_node_exporter
+            ;;
+        zabbix)
+            install_zabbix_agent
+            ;;
+        prometheus)
+            install_node_exporter
+            ;;
+        *)
+            log_info "默认安装 node_exporter"
+            install_node_exporter
+            ;;
+    esac
+    log_success "监控代理安装完成"
+}
+
+install_node_exporter() {
+    log_info "安装 Prometheus Node Exporter..."
+    local version="${CONFIG_VALUES[node_exporter_version]:-1.7.0}"
+    local arch="${OS_INFO[arch]}"
+    [[ "${arch}" == "x86_64" ]] && arch="amd64"
+    [[ "${arch}" == "aarch64" ]] && arch="arm64"
+
+    command -v node_exporter &>/dev/null && { log_info "node_exporter 已安装"; return 0; }
+
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        local download_url="https://github.com/prometheus/node_exporter/releases/download/v${version}/node_exporter-${version}.linux-${arch}.tar.gz"
+        curl -fsSL "${download_url}" -o /tmp/node_exporter.tar.gz || { log_error "下载失败"; return 1; }
+        tar -xzf /tmp/node_exporter.tar.gz -C /tmp/
+        cp "/tmp/node_exporter-${version}.linux-${arch}/node_exporter" /usr/local/bin/
+        chmod +x /usr/local/bin/node_exporter
+        rm -rf /tmp/node_exporter*
+
+        id node_exporter &>/dev/null || useradd -r -s /sbin/nologin node_exporter 2>/dev/null || true
+
+        write_config "/etc/systemd/system/node_exporter.service" "[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+
+[Service]
+Type=simple
+User=node_exporter
+Group=node_exporter
+ExecStart=/usr/local/bin/node_exporter \\
+    --web.listen-address=:9100 \\
+    --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|run)($$|/) \\
+    --collector.filesystem.fs-types-exclude=^(sys|proc|auto|devtmpfs|tmpfs|overlay)$$
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"
+        systemctl daemon-reload
+        systemctl enable node_exporter
+        systemctl start node_exporter
+    }
+    log_success "Node Exporter 安装完成"
+}
+
+install_zabbix_agent() {
+    log_info "安装 Zabbix Agent..."
+    local zabbix_server="${CONFIG_VALUES[zabbix_server]:-127.0.0.1}"
+    local hostname="$(hostname -s 2>/dev/null || echo 'unknown')"
+
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        case "${OS_INFO[family]}" in
+            rhel)
+                rpm -Uvh "https://repo.zabbix.com/zabbix/7.0/rhel/$(rpm -E %rhel)/x86_64/zabbix-release-7.0-1.el$(rpm -E %rhel).noarch.rpm" 2>/dev/null || true
+                dnf install -y zabbix-agent2 2>/dev/null || yum install -y zabbix-agent2 2>/dev/null || true
+                ;;
+            debian)
+                wget -q "https://repo.zabbix.com/zabbix/7.0/debian/pool/main/z/zabbix-release/zabbix-release_7.0-1+$(lsb_release -cs)_all.deb" -O /tmp/zabbix-release.deb 2>/dev/null || true
+                dpkg -i /tmp/zabbix-release.deb 2>/dev/null || true
+                apt-get update -qq
+                apt-get install -y zabbix-agent2 2>/dev/null || true
+                ;;
+        esac
+
+        if [[ -f /etc/zabbix/zabbix_agent2.conf ]]; then
+            backup_file "/etc/zabbix/zabbix_agent2.conf"
+            sed -i "s/^Server=.*/Server=${zabbix_server}/" /etc/zabbix/zabbix_agent2.conf 2>/dev/null || true
+            sed -i "s/^ServerActive=.*/ServerActive=${zabbix_server}/" /etc/zabbix/zabbix_agent2.conf 2>/dev/null || true
+            sed -i "s/^Hostname=.*/Hostname=${hostname}/" /etc/zabbix/zabbix_agent2.conf 2>/dev/null || true
+            systemctl enable zabbix-agent2 2>/dev/null || true
+            systemctl restart zabbix-agent2 2>/dev/null || true
+        fi
+    }
+    log_success "Zabbix Agent 安装完成"
+}
+
+# ============================================================================
+# 日志轮转配置模块
+# ============================================================================
+
+configure_logrotate() {
+    log_step "配置日志轮转策略..."
+
+    write_config "/etc/logrotate.d/system-logs" "/var/log/syslog
+/var/log/messages
+/var/log/kern.log
+/var/log/auth.log
+/var/log/daemon.log
+/var/log/cron.log
+{
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        /usr/bin/systemctl reload rsyslog > /dev/null 2>&1 || true
+    endscript
+}
+
+/var/log/nginx/*.log
+/var/log/httpd/*.log
+{
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    prerotate
+        if [ -d /etc/logrotate.d/httpd-prerotate ]; then \\
+            run-parts /etc/logrotate.d/httpd-prerotate; \\
+        fi
+    endscript
+    postrotate
+        invoke-rc.d nginx rotate >/dev/null 2>&1 || true
+    endscript
+}
+
+/var/log/mysql/*.log
+/var/log/mysql/*.err
+{
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 mysql adm
+    sharedscripts
+    postrotate
+        test -x /usr/bin/mysqladmin && mysqladmin flush-logs 2>/dev/null || true
+    endscript
+}
+
+/var/log/docker/*.log
+{
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0644 root root
+}"
+
+    log_info "配置journald日志大小限制..."
+    if [[ -f /etc/systemd/journald.conf ]]; then
+        backup_file "/etc/systemd/journald.conf"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=500M/' /etc/systemd/journald.conf 2>/dev/null || true
+            sed -i 's/^#SystemKeepFree=.*/SystemKeepFree=1G/' /etc/systemd/journald.conf 2>/dev/null || true
+            sed -i 's/^#MaxRetentionSec=.*/MaxRetentionSec=7day/' /etc/systemd/journald.conf 2>/dev/null || true
+            sed -i 's/^#MaxFileSec=.*/MaxFileSec=1day/' /etc/systemd/journald.conf 2>/dev/null || true
+            systemctl restart systemd-journald 2>/dev/null || true
+        }
+    fi
+
+    log_success "日志轮转配置完成"
+}
+
+# ============================================================================
+# SELinux/AppArmor配置模块
+# ============================================================================
+
+configure_selinux_apparmor() {
+    log_step "配置SELinux/AppArmor..."
+
+    if command -v getenforce &>/dev/null; then
+        log_info "检测到SELinux系统"
+        local current_mode="$(getenforce 2>/dev/null || echo 'Unknown')"
+        log_info "当前SELinux模式: ${current_mode}"
+
+        if [[ "${current_mode}" == "Enforcing" ]]; then
+            log_info "SELinux已处于Enforcing模式"
+        elif [[ "${current_mode}" == "Permissive" ]]; then
+            log_info "将SELinux设置为Enforcing模式..."
+            [[ ${DRY_RUN} -eq 0 ]] && {
+                backup_file "/etc/selinux/config"
+                sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config 2>/dev/null || true
+                setenforce 1 2>/dev/null || true
+            }
+        elif [[ "${current_mode}" == "Disabled" ]]; then
+            log_warning "SELinux已禁用, 建议启用"
+            [[ ${DRY_RUN} -eq 0 ]] && {
+                backup_file "/etc/selinux/config"
+                sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config 2>/dev/null || true
+                log_warning "SELinux将在下次重启后生效"
+            }
+        fi
+
+        log_info "安装SELinux管理工具..."
+        case "${OS_INFO[pkg_manager]}" in
+            yum|dnf) "${OS_INFO[pkg_manager]}" install -y setroubleshoot setools policycoreutils-python-utils 2>/dev/null || true ;;
+        esac
+
+        log_info "检查SELinux布尔值..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+            setsebool -P httpd_can_network_connect_db 1 2>/dev/null || true
+            setsebool -P nis_enabled 0 2>/dev/null || true
+        }
+
+    elif command -v aa-status &>/dev/null; then
+        log_info "检测到AppArmor系统"
+        local aa_status="$(aa-status 2>/dev/null | head -5)"
+        log_info "AppArmor状态: ${aa_status}"
+
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            case "${OS_INFO[pkg_manager]}" in
+                apt) apt-get install -y apparmor apparmor-utils 2>/dev/null || true ;;
+            esac
+            systemctl enable apparmor 2>/dev/null || true
+            systemctl start apparmor 2>/dev/null || true
+        }
+    else
+        log_info "未检测到SELinux或AppArmor, 跳过"
+    fi
+
+    log_success "SELinux/AppArmor配置完成"
+}
+
+# ============================================================================
+# 系统资源限制配置模块
+# ============================================================================
+
+configure_system_limits() {
+    log_step "配置系统资源限制..."
+
+    write_config "/etc/security/limits.d/99-system-limits.conf" "# 系统资源限制 - 由 system_init.sh 生成
+# 文件描述符
+*               soft    nofile          655360
+*               hard    nofile          655360
+root            soft    nofile          655360
+root            hard    nofile          655360
+
+# 进程数
+*               soft    nproc           655360
+*               hard    nproc           655360
+root            soft    nproc           655360
+root            hard    nproc           655360
+
+# 核心转储
+*               soft    core            unlimited
+*               hard    core            unlimited
+
+# 内存锁定
+*               soft    memlock         65536
+*               hard    memlock         65536
+
+# 堆栈大小
+*               soft    stack           8192
+*               hard    stack           65536
+
+# 优先级
+*               soft    priority        0
+*               hard    priority        0
+"
+
+    write_config "/etc/security/limits.d/99-docker-limits.conf" "# Docker资源限制
+docker          soft    nofile          655360
+docker          hard    nofile          655360
+docker          soft    nproc           655360
+docker          hard    nproc           655360
+"
+
+    if [[ -f /etc/systemd/system.conf ]]; then
+        backup_file "/etc/systemd/system.conf"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            sed -i 's/^#DefaultLimitNOFILE=.*/DefaultLimitNOFILE=655360/' /etc/systemd/system.conf 2>/dev/null || true
+            sed -i 's/^#DefaultLimitNPROC=.*/DefaultLimitNPROC=655360/' /etc/systemd/system.conf 2>/dev/null || true
+            sed -i 's/^#DefaultLimitCORE=.*/DefaultLimitCORE=infinity/' /etc/systemd/system.conf 2>/dev/null || true
+        }
+    fi
+
+    if [[ -f /etc/systemd/user.conf ]]; then
+        backup_file "/etc/systemd/user.conf"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            sed -i 's/^#DefaultLimitNOFILE=.*/DefaultLimitNOFILE=655360/' /etc/systemd/user.conf 2>/dev/null || true
+            sed -i 's/^#DefaultLimitNPROC=.*/DefaultLimitNPROC=655360/' /etc/systemd/user.conf 2>/dev/null || true
+        }
+    fi
+
+    log_info "配置内核核心转储..."
+    write_config "/etc/sysctl.d/99-core-dump.conf" "kernel.core_pattern = /var/core/core.%e.%p.%t
+kernel.core_uses_pid = 1
+fs.suid_dumpable = 0
+"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        mkdir -p /var/core 2>/dev/null || true
+        chmod 777 /var/core 2>/dev/null || true
+        sysctl -p /etc/sysctl.d/99-core-dump.conf 2>/dev/null || true
+    }
+
+    log_success "系统资源限制配置完成"
+}
+
+# ============================================================================
+# Sysctl配置检查模块
+# ============================================================================
+
+check_sysctl_config() {
+    log_step "检查sysctl配置..."
+    local expected_params=(
+        "net.core.somaxconn:65535"
+        "net.ipv4.tcp_tw_reuse:1"
+        "net.ipv4.tcp_fin_timeout:15"
+        "net.ipv4.tcp_keepalive_time:600"
+        "net.ipv4.tcp_syncookies:1"
+        "net.ipv4.ip_local_port_range:1024 65535"
+        "vm.swappiness:10"
+        "vm.overcommit_memory:0"
+        "fs.file-max:2097152"
+        "kernel.randomize_va_space:2"
+        "kernel.kptr_restrict:2"
+        "kernel.dmesg_restrict:1"
+        "net.ipv4.conf.all.rp_filter:1"
+        "net.ipv4.conf.all.accept_source_route:0"
+        "net.ipv4.conf.all.accept_redirects:0"
+        "net.ipv4.icmp_echo_ignore_broadcasts:1"
+    )
+
+    local pass=0 fail=0
+    echo -e "${CYAN}=== Sysctl配置检查 ===${NC}"
+    for check in "${expected_params[@]}"; do
+        local key="${check%%:*}" expected="${check##*:}"
+        local actual="$(sysctl -n "${key}" 2>/dev/null || echo 'N/A')"
+        if [[ "${actual}" == "${expected}" ]]; then
+            echo -e "  ${GREEN}[PASS]${NC} ${key} = ${actual}"
+            ((pass++)) || true
+        else
+            echo -e "  ${RED}[FAIL]${NC} ${key} = ${actual} (期望: ${expected})"
+            ((fail++)) || true
+        fi
+    done
+    echo ""
+    log_info "Sysctl检查: ${pass}通过, ${fail}失败"
+    [[ ${fail} -eq 0 ]] && log_success "Sysctl配置检查全部通过" || log_warning "Sysctl配置有${fail}项不符合预期"
+}
+
+# ============================================================================
+# 网络配置检查模块
+# ============================================================================
+
+check_network_config() {
+    log_step "检查网络配置..."
+    echo -e "${CYAN}=== 网络配置检查 ===${NC}"
+
+    echo -e "\n${WHITE}[DNS配置]${NC}"
+    if [[ -f /etc/resolv.conf ]]; then
+        cat /etc/resolv.conf | grep -v '^#' | grep -v '^$' | while read -r line; do
+            echo "  ${line}"
+        done
+    fi
+
+    echo -e "\n${WHITE}[网络接口]${NC}"
+    ip -br addr show 2>/dev/null | while read -r iface status addrs; do
+        echo "  ${iface}: ${status} ${addrs}"
+    done
+
+    echo -e "\n${WHITE}[路由表]${NC}"
+    ip route show | while read -r line; do
+        echo "  ${line}"
+    done
+
+    echo -e "\n${WHITE}[DNS解析测试]${NC}"
+    local test_domains=("google.com" "github.com" "aliyun.com")
+    for domain in "${test_domains[@]}"; do
+        local result="$(dig +short "${domain}" @8.8.8.8 2>/dev/null | head -1)"
+        if [[ -n "${result}" ]]; then
+            echo -e "  ${GREEN}[PASS]${NC} ${domain} -> ${result}"
+        else
+            echo -e "  ${RED}[FAIL]${NC} ${domain} 解析失败"
+        fi
+    done
+
+    echo -e "\n${WHITE}[连接测试]${NC}"
+    local test_hosts=("8.8.8.8:53" "1.1.1.1:53" "223.5.5.5:53")
+    for target in "${test_hosts[@]}"; do
+        local host="${target%%:*}" port="${target##*:}"
+        if timeout 3 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
+            echo -e "  ${GREEN}[PASS]${NC} ${host}:${port} 可达"
+        else
+            echo -e "  ${RED}[FAIL]${NC} ${host}:${port} 不可达"
+        fi
+    done
+
+    echo -e "\n${WHITE}[MTU检查]${NC}"
+    for iface in $(ip -br link show | awk '{print $1}' | grep -v lo); do
+        local mtu="$(cat /sys/class/net/${iface}/mtu 2>/dev/null || echo 'unknown')"
+        echo "  ${iface}: MTU=${mtu}"
+    done
+
+    echo -e "\n${WHITE}[TCP连接统计]${NC}"
+    ss -s 2>/dev/null | head -5 | while read -r line; do
+        echo "  ${line}"
+    done
+
+    log_success "网络配置检查完成"
+}
+
+# ============================================================================
+# 防火墙状态检查模块
+# ============================================================================
+
+check_firewall_status() {
+    log_step "检查防火墙状态..."
+    echo -e "${CYAN}=== 防火墙状态检查 ===${NC}"
+
+    case "${OS_INFO[firewall]}" in
+        firewalld)
+            if command -v firewall-cmd &>/dev/null; then
+                echo -e "\n${WHITE}[Firewalld状态]${NC}"
+                firewall-cmd --state 2>/dev/null || echo "  未运行"
+                echo -e "\n${WHITE}[默认区域]${NC}"
+                firewall-cmd --get-default-zone 2>/dev/null
+                echo -e "\n${WHITE}[开放服务]${NC}"
+                firewall-cmd --list-services 2>/dev/null | tr ' ' '\n' | while read -r svc; do
+                    echo "  ${svc}"
+                done
+                echo -e "\n${WHITE}[开放端口]${NC}"
+                firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | while read -r port; do
+                    echo "  ${port}"
+                done
+                echo -e "\n${WHITE}[富规则]${NC}"
+                firewall-cmd --list-rich-rules 2>/dev/null | while read -r rule; do
+                    echo "  ${rule}"
+                done
+            else
+                echo "  firewalld 未安装"
+            fi
+            ;;
+        ufw)
+            if command -v ufw &>/dev/null; then
+                echo -e "\n${WHITE}[UFW状态]${NC}"
+                ufw status verbose 2>/dev/null
+            else
+                echo "  ufw 未安装"
+            fi
+            ;;
+        iptables)
+            echo -e "\n${WHITE}[iptables规则]${NC}"
+            echo "  INPUT:"
+            iptables -L INPUT -n --line-numbers 2>/dev/null | while read -r line; do
+                echo "    ${line}"
+            done
+            echo "  OUTPUT:"
+            iptables -L OUTPUT -n --line-numbers 2>/dev/null | while read -r line; do
+                echo "    ${line}"
+            done
+            ;;
+    esac
+
+    log_success "防火墙状态检查完成"
+}
+
+# ============================================================================
+# 时区与区域设置模块
+# ============================================================================
+
+configure_timezone_locale() {
+    log_step "配置时区与区域设置..."
+    local timezone="${CONFIG_VALUES[timezone]:-Asia/Shanghai}"
+    local locale="${CONFIG_VALUES[locale]:-en_US.UTF-8}"
+
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        if command -v timedatectl &>/dev/null; then
+            timedatectl set-timezone "${timezone}" 2>/dev/null || true
+        elif [[ -f /usr/share/zoneinfo/${timezone} ]]; then
+            ln -sf "/usr/share/zoneinfo/${timezone}" /etc/localtime
+            echo "${timezone}" > /etc/timezone
+        fi
+
+        case "${OS_INFO[pkg_manager]}" in
+            apt)
+                apt-get install -y locales 2>/dev/null || true
+                sed -i "s/^# ${locale}/${locale}/" /etc/locale.gen 2>/dev/null || true
+                locale-gen 2>/dev/null || true
+                update-locale LANG="${locale}" 2>/dev/null || true
+                ;;
+            yum|dnf)
+                "${OS_INFO[pkg_manager]}" install -y glibc-langpack-en 2>/dev/null || true
+                localectl set-locale LANG="${locale}" 2>/dev/null || true
+                ;;
+            *)
+                log_info "跳过locale配置 (不支持的包管理器)"
+                ;;
+        esac
+    }
+
+    log_info "时区: ${timezone}, 区域: ${locale}"
+    log_success "时区与区域设置完成"
+}
+
+# ============================================================================
+# 系统清理模块
+# ============================================================================
+
+cleanup_system() {
+    log_step "清理系统..."
+
+    log_info "清理包管理器缓存..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        case "${OS_INFO[pkg_manager]}" in
+            yum)    yum clean all 2>/dev/null || true ;;
+            dnf)    dnf clean all 2>/dev/null || true; dnf autoremove -y 2>/dev/null || true ;;
+            apt)    apt-get clean 2>/dev/null || true; apt-get autoremove -y 2>/dev/null || true ;;
+            apk)    apk cache -v clean 2>/dev/null || true ;;
+            pacman) pacman -Sc --noconfirm 2>/dev/null || true ;;
+            zypper) zypper clean 2>/dev/null || true ;;
+        esac
+    }
+
+    log_info "清理旧内核..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        case "${OS_INFO[family]}" in
+            rhel)
+                if command -v package-cleanup &>/dev/null; then
+                    local kernel_count="$(package-cleanup --oldkernels --count=2 -q 2>/dev/null | wc -l)"
+                    [[ ${kernel_count} -gt 0 ]] && package-cleanup --oldkernels --count=2 -y 2>/dev/null || true
+                fi
+                ;;
+            debian)
+                local old_kernels="$(dpkg -l 'linux-image-*' 2>/dev/null | grep '^ii' | awk '{print $2}' | grep -v "$(uname -r)" | head -5)"
+                for kernel in ${old_kernels}; do
+                    apt-get purge -y "${kernel}" 2>/dev/null || true
+                done
+                ;;
+        esac
+    }
+
+    log_info "清理临时文件..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        find /tmp -type f -atime +7 -delete 2>/dev/null || true
+        find /var/tmp -type f -atime +7 -delete 2>/dev/null || true
+        find /var/log -type f -name "*.gz" -mtime +30 -delete 2>/dev/null || true
+        find /var/log -type f -name "*.old" -mtime +30 -delete 2>/dev/null || true
+        find /var/log -type f -name "*.1" -mtime +30 -delete 2>/dev/null || true
+    }
+
+    log_info "清理systemd日志..."
+    [[ ${DRY_RUN} -eq 0 ]] && journalctl --vacuum-time=7d 2>/dev/null || true
+
+    log_info "清理Docker..."
+    [[ ${DRY_RUN} -eq 0 ]] && command -v docker &>/dev/null && {
+        docker system prune -af --volumes 2>/dev/null || true
+        docker image prune -af 2>/dev/null || true
+        docker volume prune -f 2>/dev/null || true
+    } || true
+
+    log_success "系统清理完成"
+}
+
+# ============================================================================
+# 系统完整性检查模块
+# ============================================================================
+
+check_system_integrity() {
+    log_step "检查系统完整性..."
+
+    echo -e "${CYAN}=== 系统完整性检查 ===${NC}"
+
+    echo -e "\n${WHITE}[关键文件完整性]${NC}"
+    local critical_files=(
+        "/etc/passwd" "/etc/shadow" "/etc/group" "/etc/gshadow"
+        "/etc/ssh/sshd_config" "/etc/sudoers" "/etc/fstab"
+        "/etc/hosts" "/etc/resolv.conf" "/etc/crontab"
+    )
+    for file in "${critical_files[@]}"; do
+        if [[ -f "${file}" ]]; then
+            local checksum="$(sha256sum "${file}" 2>/dev/null | awk '{print $1}')"
+            local perms="$(stat -c %a "${file}" 2>/dev/null || stat -f %Lp "${file}" 2>/dev/null)"
+            local owner="$(stat -c '%U:%G' "${file}" 2>/dev/null || stat -f '%Su:%Sg' "${file}" 2>/dev/null)"
+            echo "  ${file}: sha256=${checksum:0:16}... perms=${perms} owner=${owner}"
+        else
+            echo -e "  ${RED}[MISSING]${NC} ${file}"
+        fi
+    done
+
+    echo -e "\n${WHITE}[RPM/DPKG完整性检查]${NC}"
+    if command -v rpm &>/dev/null; then
+        local rpm_check="$(rpm -Va 2>/dev/null | head -20)"
+        if [[ -n "${rpm_check}" ]]; then
+            echo "  已修改的RPM包 (前20条):"
+            echo "${rpm_check}" | while read -r line; do
+                echo "    ${line}"
+            done
+        else
+            echo "  所有RPM包完整性正常"
+        fi
+    elif command -v debsums &>/dev/null; then
+        local deb_check="$(debsums -c 2>/dev/null | head -20)"
+        if [[ -n "${deb_check}" ]]; then
+            echo "  已修改的DEB包文件 (前20条):"
+            echo "${deb_check}" | while read -r line; do
+                echo "    ${line}"
+            done
+        else
+            echo "  所有DEB包完整性正常"
+        fi
+    fi
+
+    echo -e "\n${WHITE}[系统运行状态]${NC}"
+    echo "  运行时间: $(uptime -p 2>/dev/null || uptime)"
+    echo "  负载: $(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}')"
+    echo "  内存: $(free -h | awk '/^Mem:/{print "已用"$3"/总计"$2" ("$3/$2*100"%)"}')"
+    echo "  Swap: $(free -h | awk '/^Swap:/{print "已用"$3"/总计"$2}')"
+
+    log_success "系统完整性检查完成"
 }
 
 parse_args() {
@@ -1059,31 +2151,46 @@ parse_args() {
                 SELECTED_MODULES[network]=1; SELECTED_MODULES[users]=1; SELECTED_MODULES[ssh]=1
                 SELECTED_MODULES[firewall]=1; SELECTED_MODULES[time_sync]=1; SELECTED_MODULES[swap]=1
                 SELECTED_MODULES[disk]=1; SELECTED_MODULES[security]=1; SELECTED_MODULES[docker]=1
-                SELECTED_MODULES[devtools]=1; SELECTED_MODULES[report]=1 ;;
-            --mirror)      SELECTED_MODULES[mirror]=1 ;;
-            --packages)    SELECTED_MODULES[packages]=1 ;;
-            --kernel)      SELECTED_MODULES[kernel]=1 ;;
-            --network)     SELECTED_MODULES[network]=1 ;;
-            --users)       SELECTED_MODULES[users]=1 ;;
-            --ssh)         SELECTED_MODULES[ssh]=1 ;;
-            --firewall)    SELECTED_MODULES[firewall]=1 ;;
-            --time-sync)   SELECTED_MODULES[time_sync]=1 ;;
-            --swap)        SELECTED_MODULES[swap]=1 ;;
-            --disk)        SELECTED_MODULES[disk]=1 ;;
-            --security)    SELECTED_MODULES[security]=1 ;;
-            --docker)      SELECTED_MODULES[docker]=1 ;;
-            --devtools)    SELECTED_MODULES[devtools]=1 ;;
-            --report)      SELECTED_MODULES[report]=1 ;;
-            --dry-run)          DRY_RUN=1 ;;
-            --non-interactive)  INTERACTIVE=0 ;;
-            --verbose)          VERBOSE=1 ;;
-            --config)           CONFIG_FILE="$2"; shift ;;
-            --rollback)         ROLLBACK_MODE=1 ;;
+                SELECTED_MODULES[devtools]=1; SELECTED_MODULES[report]=1
+                SELECTED_MODULES[audit]=1; SELECTED_MODULES[hardening]=1; SELECTED_MODULES[monitoring]=1
+                SELECTED_MODULES[logrotate]=1; SELECTED_MODULES[selinux]=1; SELECTED_MODULES[limits]=1
+                SELECTED_MODULES[timezone_locale]=1; SELECTED_MODULES[cleanup]=1; SELECTED_MODULES[integrity]=1
+                shift ;;
+            --mirror)      SELECTED_MODULES[mirror]=1; shift ;;
+            --packages)    SELECTED_MODULES[packages]=1; shift ;;
+            --kernel)      SELECTED_MODULES[kernel]=1; shift ;;
+            --network)     SELECTED_MODULES[network]=1; shift ;;
+            --users)       SELECTED_MODULES[users]=1; shift ;;
+            --ssh)         SELECTED_MODULES[ssh]=1; shift ;;
+            --firewall)    SELECTED_MODULES[firewall]=1; shift ;;
+            --time-sync)   SELECTED_MODULES[time_sync]=1; shift ;;
+            --swap)        SELECTED_MODULES[swap]=1; shift ;;
+            --disk)        SELECTED_MODULES[disk]=1; shift ;;
+            --security)    SELECTED_MODULES[security]=1; shift ;;
+            --docker)      SELECTED_MODULES[docker]=1; shift ;;
+            --devtools)    SELECTED_MODULES[devtools]=1; shift ;;
+            --report)      SELECTED_MODULES[report]=1; shift ;;
+            --audit)       SELECTED_MODULES[audit]=1; shift ;;
+            --hardening)   SELECTED_MODULES[hardening]=1; shift ;;
+            --monitoring)  SELECTED_MODULES[monitoring]=1; shift ;;
+            --logrotate)   SELECTED_MODULES[logrotate]=1; shift ;;
+            --selinux)     SELECTED_MODULES[selinux]=1; shift ;;
+            --limits)      SELECTED_MODULES[limits]=1; shift ;;
+            --sysctl-check)   CHECK_MODE=sysctl; shift ;;
+            --network-check)  CHECK_MODE=network; shift ;;
+            --firewall-check) CHECK_MODE=firewall; shift ;;
+            --cleanup)     SELECTED_MODULES[cleanup]=1; shift ;;
+            --integrity)   SELECTED_MODULES[integrity]=1; shift ;;
+            --timezone)    SELECTED_MODULES[timezone_locale]=1; shift ;;
+            --dry-run)          DRY_RUN=1; shift ;;
+            --non-interactive)  INTERACTIVE=0; shift ;;
+            --verbose)          VERBOSE=1; shift ;;
+            --config)           CONFIG_FILE="$2"; shift 2 ;;
+            --rollback)         ROLLBACK_MODE=1; shift ;;
             --help|-h)          show_usage; exit 0 ;;
             --version|-v)       echo "v${SCRIPT_VERSION}"; exit 0 ;;
             *)                  log_error "未知选项: $1"; show_usage; exit 1 ;;
         esac
-        shift
     done
 }
 
@@ -1092,20 +2199,29 @@ run_modules() {
     [[ ${total} -eq 0 ]] && { log_error "没有选择任何模块"; show_usage; exit 1; }
     log_info "将执行 ${total} 个模块..."
 
-    [[ -n "${SELECTED_MODULES[mirror]:-}" ]]      && { ((current++)); configure_mirror; }
-    [[ -n "${SELECTED_MODULES[packages]:-}" ]]     && { ((current++)); install_base_packages; }
-    [[ -n "${SELECTED_MODULES[kernel]:-}" ]]       && { ((current++)); optimize_kernel; }
-    [[ -n "${SELECTED_MODULES[network]:-}" ]]      && { ((current++)); optimize_network; }
-    [[ -n "${SELECTED_MODULES[users]:-}" ]]        && { ((current++)); manage_users; }
-    [[ -n "${SELECTED_MODULES[ssh]:-}" ]]          && { ((current++)); harden_ssh; }
-    [[ -n "${SELECTED_MODULES[firewall]:-}" ]]     && { ((current++)); configure_firewall; }
-    [[ -n "${SELECTED_MODULES[time_sync]:-}" ]]    && { ((current++)); configure_time_sync; }
-    [[ -n "${SELECTED_MODULES[swap]:-}" ]]         && { ((current++)); configure_swap; }
-    [[ -n "${SELECTED_MODULES[disk]:-}" ]]         && { ((current++)); configure_disk; }
-    [[ -n "${SELECTED_MODULES[security]:-}" ]]     && { ((current++)); harden_security; }
-    [[ -n "${SELECTED_MODULES[docker]:-}" ]]       && { ((current++)); install_docker; }
-    [[ -n "${SELECTED_MODULES[devtools]:-}" ]]     && { ((current++)); install_devtools; }
-    [[ -n "${SELECTED_MODULES[report]:-}" ]]       && { ((current++)); generate_report; }
+    [[ -n "${SELECTED_MODULES[mirror]:-}" ]]           && { ((current++)); configure_mirror; }
+    [[ -n "${SELECTED_MODULES[packages]:-}" ]]          && { ((current++)); install_base_packages; }
+    [[ -n "${SELECTED_MODULES[kernel]:-}" ]]            && { ((current++)); optimize_kernel; }
+    [[ -n "${SELECTED_MODULES[network]:-}" ]]           && { ((current++)); optimize_network; }
+    [[ -n "${SELECTED_MODULES[users]:-}" ]]             && { ((current++)); manage_users; }
+    [[ -n "${SELECTED_MODULES[ssh]:-}" ]]               && { ((current++)); harden_ssh; }
+    [[ -n "${SELECTED_MODULES[firewall]:-}" ]]          && { ((current++)); configure_firewall; }
+    [[ -n "${SELECTED_MODULES[time_sync]:-}" ]]         && { ((current++)); configure_time_sync; }
+    [[ -n "${SELECTED_MODULES[swap]:-}" ]]              && { ((current++)); configure_swap; }
+    [[ -n "${SELECTED_MODULES[disk]:-}" ]]              && { ((current++)); configure_disk; }
+    [[ -n "${SELECTED_MODULES[security]:-}" ]]          && { ((current++)); harden_security; }
+    [[ -n "${SELECTED_MODULES[docker]:-}" ]]            && { ((current++)); install_docker; }
+    [[ -n "${SELECTED_MODULES[devtools]:-}" ]]          && { ((current++)); install_devtools; }
+    [[ -n "${SELECTED_MODULES[audit]:-}" ]]             && { ((current++)); run_security_audit; }
+    [[ -n "${SELECTED_MODULES[hardening]:-}" ]]         && { ((current++)); apply_cis_hardening; }
+    [[ -n "${SELECTED_MODULES[monitoring]:-}" ]]        && { ((current++)); install_monitoring; }
+    [[ -n "${SELECTED_MODULES[logrotate]:-}" ]]         && { ((current++)); configure_logrotate; }
+    [[ -n "${SELECTED_MODULES[selinux]:-}" ]]           && { ((current++)); configure_selinux_apparmor; }
+    [[ -n "${SELECTED_MODULES[limits]:-}" ]]            && { ((current++)); configure_system_limits; }
+    [[ -n "${SELECTED_MODULES[timezone_locale]:-}" ]]   && { ((current++)); configure_timezone_locale; }
+    [[ -n "${SELECTED_MODULES[cleanup]:-}" ]]           && { ((current++)); cleanup_system; }
+    [[ -n "${SELECTED_MODULES[integrity]:-}" ]]         && { ((current++)); check_system_integrity; }
+    [[ -n "${SELECTED_MODULES[report]:-}" ]]            && { ((current++)); generate_report; }
 
     echo ""
     log_success "=========================================="
@@ -1126,6 +2242,12 @@ main() {
     detect_os; check_prerequisites
 
     [[ ${DRY_RUN} -eq 1 ]] && log_warning "====== 模拟运行模式 ======"
+
+    case "${CHECK_MODE:-}" in
+        sysctl)   check_sysctl_config; exit 0 ;;
+        network)  check_network_config; exit 0 ;;
+        firewall) check_firewall_status; exit 0 ;;
+    esac
 
     [[ ${INTERACTIVE} -eq 1 ]] && [[ ${DRY_RUN} -eq 0 ]] && {
         echo -e "${YELLOW}即将执行系统初始化, 所有原始配置将被备份到: ${BACKUP_DIR}/${TIMESTAMP}${NC}"

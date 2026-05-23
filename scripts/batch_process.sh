@@ -60,7 +60,7 @@ STATS[total]=0; STATS[success]=0; STATS[failed]=0; STATS[unreachable]=0; STATS[s
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
-WHITE='\033[1;37m'; NC='\033[0m'
+WHITE='\033[1;37m'; NC='\033[0m'; DIM='\033[2m'
 
 log() {
     local level="$1"; shift; local message="$*"
@@ -866,6 +866,956 @@ print_summary() {
 }
 
 # ============================================================================
+# 批量Docker管理模块
+# ============================================================================
+
+# ============================================================================
+# 批量主机资产登记
+# ============================================================================
+
+# ============================================================================
+# 批量主机分组管理
+# ============================================================================
+
+# ============================================================================
+# 批量主机配置差异检测
+# ============================================================================
+
+batch_config_diff() {
+    local config_path="$1"
+    [[ -z "${config_path}" ]] && { log_error "请指定配置文件路径"; return 1; }
+    log_step "批量检测配置差异: ${config_path}..."
+
+    local ref_content=""
+    local ref_host="${HOST_LIST[0]}"
+    ref_content="$(ssh_exec_cmd "${ref_host}" "cat ${config_path}" 2>/dev/null || echo '')"
+
+    if [[ -z "${ref_content}" ]]; then
+        log_error "参考主机 ${ref_host} 配置文件读取失败"
+        return 1
+    fi
+
+    log_info "参考主机: ${ref_host}"
+    for host in "${HOST_LIST[@]:1}"; do
+        local host_content="$(ssh_exec_cmd "${host}" "cat ${config_path}" 2>/dev/null || echo '')"
+        if [[ "${host_content}" == "${ref_content}" ]]; then
+            log_success "[${host}] 配置一致"
+        else
+            log_warning "[${host}] 配置不一致"
+            [[ ${VERBOSE} -eq 1 ]] && {
+                diff <(echo "${ref_content}") <(echo "${host_content}") | head -20 || true
+            }
+        fi
+    done
+}
+
+# ============================================================================
+# 批量主机负载均衡检查
+# ============================================================================
+
+batch_load_check() {
+    log_step "批量检查主机负载..."
+    for host in "${HOST_LIST[@]}"; do
+        local load_info="$(ssh_exec_cmd "${host}" "cat /proc/loadavg 2>/dev/null && nproc 2>/dev/null" 2>/dev/null || echo 'unknown')"
+        local load1="$(echo "${load_info}" | head -1 | awk '{print $1}')"
+        local cpu_count="$(echo "${load_info}" | tail -1)"
+        if [[ "${load1}" != "unknown" ]] && [[ -n "${cpu_count}" ]]; then
+            local load_pct="$(echo "scale=0; ${load1} * 100 / ${cpu_count}" | bc 2>/dev/null || echo '0')"
+            if [[ ${load_pct%.*} -gt 80 ]]; then
+                log_error "[${host}] 负载过高: ${load1}/${cpu_count}核 (${load_pct}%)"
+            elif [[ ${load_pct%.*} -gt 50 ]]; then
+                log_warning "[${host}] 负载较高: ${load1}/${cpu_count}核 (${load_pct}%)"
+            else
+                log_success "[${host}] 负载正常: ${load1}/${cpu_count}核 (${load_pct}%)"
+            fi
+        fi
+    done
+}
+
+# ============================================================================
+# 批量主机分组管理
+# ============================================================================
+
+batch_group_hosts() {
+    local group_name="$1" group_pattern="$2"
+    [[ -z "${group_name}" ]] && { log_error "请指定组名"; return 1; }
+    log_step "创建主机组: ${group_name}..."
+    local group_file="${SCRIPT_DIR}/host_groups.ini"
+    echo "[${group_name}]" >> "${group_file}"
+    for host in "${HOST_LIST[@]}"; do
+        if [[ -n "${group_pattern}" ]]; then
+            [[ "${host}" =~ ${group_pattern} ]] && echo "${host}" >> "${group_file}"
+        else
+            echo "${host}" >> "${group_file}"
+        fi
+    done
+    log_success "主机组 ${group_name} 已创建"
+}
+
+# ============================================================================
+# 批量主机标签查询
+# ============================================================================
+
+batch_query_by_label() {
+    local label="$1"
+    [[ -z "${label}" ]] && { log_error "请指定标签"; return 1; }
+    log_step "查询标签为 ${label} 的主机..."
+    local label_file="${SCRIPT_DIR}/host_labels.txt"
+    if [[ -f "${label_file}" ]]; then
+        grep ":${label}$" "${label_file}" | while read -r line; do
+            local host="${line%%:*}"
+            log_info "  ${host}"
+        done
+    else
+        log_warning "标签文件不存在"
+    fi
+}
+
+# ============================================================================
+# 批量执行结果汇总
+# ============================================================================
+
+batch_summary() {
+    log_step "执行结果汇总..."
+    local total=${#HOST_LIST[@]}
+    local success=0 failed=0 timeout=0
+
+    for host in "${HOST_LIST[@]}"; do
+        local result_file="${RESULT_DIR}/${host}.result"
+        if [[ -f "${result_file}" ]]; then
+            local exit_code="$(tail -1 "${result_file}" | grep -oP 'EXIT_CODE:\K\d+' 2>/dev/null || echo '0')"
+            case "${exit_code}" in
+                0)  ((success++)) || true ;;
+                124) ((timeout++)) || true ;;
+                *)  ((failed++)) || true ;;
+            esac
+        else
+            ((failed++)) || true
+        fi
+    done
+
+    echo ""
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}  批量操作结果汇总${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "  总主机数: ${total}"
+    echo -e "  ${GREEN}成功: ${success}${NC}"
+    echo -e "  ${RED}失败: ${failed}${NC}"
+    echo -e "  ${YELLOW}超时: ${timeout}${NC}"
+    echo -e "${CYAN}========================================${NC}"
+
+    if [[ ${failed} -gt 0 ]]; then
+        log_warning "失败主机:"
+        for host in "${HOST_LIST[@]}"; do
+            local result_file="${RESULT_DIR}/${host}.result"
+            if [[ -f "${result_file}" ]]; then
+                local exit_code="$(tail -1 "${result_file}" | grep -oP 'EXIT_CODE:\K\d+' 2>/dev/null || echo '0')"
+                [[ "${exit_code}" != "0" ]] && [[ "${exit_code}" != "124" ]] && log_warning "  ${host}"
+            else
+                log_warning "  ${host} (无结果)"
+            fi
+        done
+    fi
+}
+
+# ============================================================================
+# 批量主机资产登记
+# ============================================================================
+
+batch_asset_inventory() {
+    log_step "批量主机资产登记..."
+    local inventory_file="${RESULT_DIR}/asset_inventory.csv"
+    echo "主机,IP,OS,内核,CPU核数,内存(GB),磁盘(GB),运行时间,主机名" > "${inventory_file}"
+
+    for host in "${HOST_LIST[@]}"; do
+        local info="$(ssh_exec_cmd "${host}" "source /etc/os-release 2>/dev/null; echo \"\${PRETTY_NAME:-unknown}\"; uname -r; nproc; free -g | awk '/Mem:/{print \$2}'; df -BG / | awk 'NR==2{print \$2}'; uptime -p 2>/dev/null || uptime | awk -F'up ' '{print \$2}' | awk -F',' '{print \$1}'; hostname" 2>/dev/null || echo "unknown")"
+        local os_name="$(echo "${info}" | sed -n '1p')"
+        local kernel="$(echo "${info}" | sed -n '2p')"
+        local cpu_cores="$(echo "${info}" | sed -n '3p')"
+        local memory="$(echo "${info}" | sed -n '4p')"
+        local disk="$(echo "${info}" | sed -n '5p')"
+        local uptime_info="$(echo "${info}" | sed -n '6p')"
+        local hostname_val="$(echo "${info}" | sed -n '7p')"
+        echo "${hostname_val},${host},${os_name},${kernel},${cpu_cores},${memory},${disk},${uptime_info},${hostname_val}" >> "${inventory_file}"
+        log_info "[${host}] 资产已登记"
+    done
+
+    log_success "资产登记完成: ${inventory_file}"
+    column -t -s',' "${inventory_file}"
+}
+
+# ============================================================================
+# 批量主机合规检查
+# ============================================================================
+
+batch_compliance_check() {
+    log_step "批量合规检查..."
+    local check_items=(
+        "密码策略:awk '/pass_min_days/{print \$2}' /etc/login.defs"
+        "密码长度:awk '/minlen/{print \$NF}' /etc/security/pwquality.conf 2>/dev/null || echo N/A"
+        "SSH root登录:grep -c '^PermitRootLogin yes' /etc/ssh/sshd_config 2>/dev/null || echo 0"
+        "空密码账户:awk -F: '(\$2==\"\"||\$2==\"!\")' /etc/shadow | wc -l"
+        "密码过期:awk -F: '(\$5>0 && \$5<90)' /etc/shadow | wc -l"
+        "sudo免密:grep -c 'NOPASSWD' /etc/sudoers /etc/sudoers.d/* 2>/dev/null || echo 0"
+        "开放端口:ss -tlnp | wc -l"
+        "防火墙状态:systemctl is-active firewalld 2>/dev/null || ufw status 2>/dev/null | head -1"
+        "SELinux:getenforce 2>/dev/null || echo N/A"
+        "最近登录:last -5 2>/dev/null | head -5"
+    )
+
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 合规检查:"
+        for item in "${check_items[@]}"; do
+            local name="${item%%:*}"
+            local cmd="${item#*:}"
+            local result="$(ssh_exec_cmd "${host}" "${cmd}" 2>/dev/null || echo '检查失败')"
+            log_info "  ${name}: ${result}"
+        done
+    done
+}
+
+# ============================================================================
+# 批量日志分析
+# ============================================================================
+
+batch_analyze_logs() {
+    local log_path="${1:-/var/log/syslog}"
+    local pattern="${2:-error|fail|critical|fatal}"
+    log_step "批量分析日志: ${log_path} (关键词: ${pattern})..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 日志分析:"
+        ssh_exec_cmd "${host}" "grep -ciE '${pattern}' ${log_path} 2>/dev/null || echo '0'" | while read -r count; do
+            if [[ ${count} -gt 0 ]]; then
+                log_warning "[${host}] 发现${count}条匹配记录"
+                ssh_exec_cmd "${host}" "grep -iE '${pattern}' ${log_path} 2>/dev/null | tail -5" || true
+            else
+                log_success "[${host}] 无匹配记录"
+            fi
+        done
+    done
+}
+
+# ============================================================================
+# 批量服务依赖检查
+# ============================================================================
+
+batch_check_dependencies() {
+    log_step "批量检查服务依赖..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 服务依赖:"
+        ssh_exec_cmd "${host}" "systemctl list-dependencies --all 2>/dev/null | grep 'failed' || echo '所有依赖正常'" || log_warning "[${host}] 依赖检查失败"
+    done
+}
+
+# ============================================================================
+# 批量证书检查
+# ============================================================================
+
+batch_check_certificates() {
+    log_step "批量检查SSL证书..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] SSL证书:"
+        ssh_exec_cmd "${host}" "for cert in /etc/ssl/certs/*.pem /etc/pki/tls/certs/*.crt /etc/letsencrypt/live/*/cert.pem; do [[ -f \"\${cert}\" ]] && echo \"\${cert}: \$(openssl x509 -enddate -noout -in \"\${cert}\" 2>/dev/null | cut -d= -f2)\"; done 2>/dev/null | head -10 || echo '无证书文件'" || log_warning "[${host}] 证书检查失败"
+    done
+}
+
+# ============================================================================
+# 批量内核参数检查
+# ============================================================================
+
+batch_check_sysctl() {
+    local param="${1:-}"
+    log_step "批量检查内核参数${param:+: ${param}}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 内核参数:"
+        if [[ -n "${param}" ]]; then
+            ssh_exec_cmd "${host}" "sysctl ${param} 2>/dev/null || echo '参数不存在'" || true
+        else
+            ssh_exec_cmd "${host}" "sysctl -a 2>/dev/null | grep -E 'net.core.somaxconn|net.ipv4.tcp_max_syn_backlog|vm.swappiness|fs.file-max|net.ipv4.ip_forward' | head -10" || true
+        fi
+    done
+}
+
+# ============================================================================
+# 批量Docker管理模块
+# ============================================================================
+
+batch_docker_ps() {
+    log_step "批量查看Docker容器状态..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] Docker容器:"
+        ssh_exec_cmd "${host}" "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'" 2>/dev/null || log_warning "[${host}] Docker不可用"
+    done
+}
+
+batch_docker_pull() {
+    local image="$1"
+    [[ -z "${image}" ]] && { log_error "请指定镜像名称"; return 1; }
+    log_step "批量拉取Docker镜像: ${image}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 拉取 ${image}..."
+        ssh_exec_cmd "${host}" "docker pull ${image}" || log_warning "[${host}] 拉取失败"
+    done
+}
+
+batch_docker_cleanup() {
+    log_step "批量清理Docker资源..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 清理Docker..."
+        ssh_exec_cmd "${host}" "docker system prune -af --volumes 2>/dev/null" || log_warning "[${host}] Docker清理失败"
+    done
+}
+
+batch_docker_compose() {
+    local action="$1" compose_file="${2:-docker-compose.yml}"
+    [[ -z "${action}" ]] && { log_error "请指定compose操作 (up/down/restart)"; return 1; }
+    log_step "批量Docker Compose ${action}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] docker-compose ${action}..."
+        ssh_exec_cmd "${host}" "cd $(dirname "${compose_file}") && docker-compose ${action} -d" || log_warning "[${host}] compose操作失败"
+    done
+}
+
+# ============================================================================
+# 批量磁盘与文件系统管理
+# ============================================================================
+
+batch_disk_usage() {
+    log_step "批量检查磁盘使用情况..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 磁盘使用:"
+        ssh_exec_cmd "${host}" "df -h | grep -v tmpfs | grep -v devtmpfs" || log_warning "[${host}] 获取磁盘信息失败"
+    done
+}
+
+batch_disk_io() {
+    log_step "批量检查磁盘IO..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 磁盘IO:"
+        ssh_exec_cmd "${host}" "iostat -x 1 3 2>/dev/null || cat /proc/diskstats" || log_warning "[${host}] 获取IO信息失败"
+    done
+}
+
+batch_find_large_files() {
+    local min_size="${1:-100M}"
+    local search_dir="${2:-/}"
+    log_step "批量查找大文件 (>${min_size})..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 查找大文件..."
+        ssh_exec_cmd "${host}" "find ${search_dir} -type f -size +${min_size} -exec ls -lh {} \; 2>/dev/null | head -20" || log_warning "[${host}] 查找失败"
+    done
+}
+
+batch_clean_tmp() {
+    local days="${1:-7}"
+    log_step "批量清理临时文件 (>${days}天)..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 清理临时文件..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "find /tmp -type f -mtime +${days} -delete 2>/dev/null; find /var/tmp -type f -mtime +${days} -delete 2>/dev/null" || true
+        }
+    done
+}
+
+# ============================================================================
+# 批量网络管理
+# ============================================================================
+
+batch_network_info() {
+    log_step "批量获取网络信息..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 网络信息:"
+        ssh_exec_cmd "${host}" "ip addr show | grep 'inet ' | awk '{print \$2, \$NF}'" || log_warning "[${host}] 获取网络信息失败"
+    done
+}
+
+batch_port_check() {
+    local port="$1"
+    [[ -z "${port}" ]] && { log_error "请指定端口号"; return 1; }
+    log_step "批量检查端口: ${port}..."
+    for host in "${HOST_LIST[@]}"; do
+        local result="$(ssh_exec_cmd "${host}" "ss -tlnp | grep ':${port} ' || echo 'NOT_LISTENING'")"
+        if [[ "${result}" == "NOT_LISTENING" ]]; then
+            log_warning "[${host}] 端口${port}未监听"
+        else
+            log_success "[${host}] 端口${port}已监听"
+        fi
+    done
+}
+
+batch_firewall_manage() {
+    local action="$1" rule="${2:-}"
+    [[ -z "${action}" ]] && { log_error "请指定防火墙操作 (status/open/close/rule)"; return 1; }
+    log_step "批量防火墙管理: ${action}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 防火墙${action}..."
+        case "${action}" in
+            status)
+                ssh_exec_cmd "${host}" "systemctl is-active firewalld 2>/dev/null || ufw status 2>/dev/null || iptables -L -n 2>/dev/null" || true
+                ;;
+            open)
+                ssh_exec_cmd "${host}" "systemctl start firewalld 2>/dev/null || ufw enable 2>/dev/null" || true
+                ;;
+            close)
+                ssh_exec_cmd "${host}" "systemctl stop firewalld 2>/dev/null || ufw disable 2>/dev/null" || true
+                ;;
+            rule)
+                [[ -z "${rule}" ]] && { log_error "请指定规则"; continue; }
+                ssh_exec_cmd "${host}" "firewall-cmd --add-port=${rule}/tcp --permanent 2>/dev/null && firewall-cmd --reload 2>/dev/null || ufw allow ${rule} 2>/dev/null || iptables -A INPUT -p tcp --dport ${rule} -j ACCEPT 2>/dev/null" || true
+                ;;
+        esac
+    done
+}
+
+batch_ping_test() {
+    log_step "批量Ping测试..."
+    for host in "${HOST_LIST[@]}"; do
+        if ping -c 1 -W 3 "${host}" &>/dev/null; then
+            local latency="$(ping -c 3 -W 3 "${host}" 2>/dev/null | tail -1 | awk -F '/' '{print $5}')"
+            log_success "[${host}] 可达 (${latency}ms)"
+        else
+            log_error "[${host}] 不可达"
+        fi
+    done
+}
+
+# ============================================================================
+# 批量进程管理
+# ============================================================================
+
+batch_process_list() {
+    local pattern="${1:-}"
+    log_step "批量查看进程${pattern:+ (过滤: ${pattern})}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 进程列表:"
+        if [[ -n "${pattern}" ]]; then
+            ssh_exec_cmd "${host}" "ps aux | grep -E '${pattern}' | grep -v grep" || log_warning "[${host}] 未找到匹配进程"
+        else
+            ssh_exec_cmd "${host}" "ps aux --sort=-%mem | head -20" || log_warning "[${host}] 获取进程列表失败"
+        fi
+    done
+}
+
+batch_process_kill() {
+    local pattern="$1"
+    [[ -z "${pattern}" ]] && { log_error "请指定进程名或PID"; return 1; }
+    log_step "批量终止进程: ${pattern}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 终止进程..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "pkill -f '${pattern}' 2>/dev/null || kill ${pattern} 2>/dev/null" || log_warning "[${host}] 进程终止失败"
+        }
+    done
+}
+
+# ============================================================================
+# 批量系统信息收集
+# ============================================================================
+
+batch_system_info() {
+    log_step "批量收集系统信息..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 系统信息:"
+        ssh_exec_cmd "${host}" "echo '=== OS ===' && cat /etc/os-release 2>/dev/null | head -3 && echo '=== Kernel ===' && uname -r && echo '=== CPU ===' && nproc && echo '=== Memory ===' && free -h | head -2 && echo '=== Uptime ===' && uptime && echo '=== Hostname ===' && hostname" || log_warning "[${host}] 信息收集失败"
+    done
+}
+
+batch_kernel_info() {
+    log_step "批量收集内核信息..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 内核信息:"
+        ssh_exec_cmd "${host}" "uname -a && echo '---' && cat /proc/cmdline 2>/dev/null" || log_warning "[${host}] 内核信息获取失败"
+    done
+}
+
+# ============================================================================
+# 批量Cron任务管理
+# ============================================================================
+
+batch_cron_list() {
+    log_step "批量列出Cron任务..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] Cron任务:"
+        ssh_exec_cmd "${host}" "crontab -l 2>/dev/null || echo '(无Cron任务)'" || log_warning "[${host}] 获取Cron任务失败"
+    done
+}
+
+batch_cron_add() {
+    local cron_entry="$1"
+    [[ -z "${cron_entry}" ]] && { log_error "请指定Cron条目"; return 1; }
+    log_step "批量添加Cron任务: ${cron_entry}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 添加Cron任务..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "(crontab -l 2>/dev/null; echo '${cron_entry}') | crontab -" || log_warning "[${host}] Cron添加失败"
+        }
+    done
+}
+
+batch_cron_remove() {
+    local pattern="$1"
+    [[ -z "${pattern}" ]] && { log_error "请指定Cron条目匹配模式"; return 1; }
+    log_step "批量删除Cron任务: ${pattern}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 删除Cron任务..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "crontab -l 2>/dev/null | grep -v '${pattern}' | crontab -" || log_warning "[${host}] Cron删除失败"
+        }
+    done
+}
+
+# ============================================================================
+# 批量环境变量管理
+# ============================================================================
+
+batch_set_env() {
+    local key="$1" value="$2"
+    [[ -z "${key}" ]] && { log_error "请指定环境变量名"; return 1; }
+    log_step "批量设置环境变量: ${key}=${value}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 设置环境变量..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "grep -q '^export ${key}=' /etc/profile && sed -i 's|^export ${key}=.*|export ${key}=${value}|' /etc/profile || echo 'export ${key}=${value}' >> /etc/profile" || log_warning "[${host}] 环境变量设置失败"
+        }
+    done
+}
+
+batch_get_env() {
+    local key="$1"
+    [[ -z "${key}" ]] && { log_error "请指定环境变量名"; return 1; }
+    log_step "批量获取环境变量: ${key}..."
+    for host in "${HOST_LIST[@]}"; do
+        local val="$(ssh_exec_cmd "${host}" "source /etc/profile 2>/dev/null; echo \${${key}}" 2>/dev/null)"
+        log_info "[${host}] ${key}=${val:-未设置}"
+    done
+}
+
+# ============================================================================
+# 批量文件权限管理
+# ============================================================================
+
+batch_chmod() {
+    local path="$1" perms="$2"
+    [[ -z "${path}" ]] || [[ -z "${perms}" ]] && { log_error "用法: --chmod 路径 权限"; return 1; }
+    log_step "批量修改文件权限: ${path} -> ${perms}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 修改权限..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "chmod ${perms} ${path}" || log_warning "[${host}] 权限修改失败"
+        }
+    done
+}
+
+batch_chown() {
+    local path="$1" owner="$2"
+    [[ -z "${path}" ]] || [[ -z "${owner}" ]] && { log_error "用法: --chown 路径 所有者"; return 1; }
+    log_step "批量修改文件所有者: ${path} -> ${owner}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 修改所有者..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "chown ${owner} ${path}" || log_warning "[${host}] 所有者修改失败"
+        }
+    done
+}
+
+# ============================================================================
+# 批量时间同步管理
+# ============================================================================
+
+batch_time_sync() {
+    log_step "批量时间同步..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 当前时间: $(ssh_exec_cmd "${host}" 'date' 2>/dev/null)"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "timedatectl set-ntp true 2>/dev/null || ntpdate -u pool.ntp.org 2>/dev/null || chronyc -a makestep 2>/dev/null" || log_warning "[${host}] 时间同步失败"
+        }
+    done
+}
+
+batch_timezone_set() {
+    local tz="$1"
+    [[ -z "${tz}" ]] && { log_error "请指定时区 (如 Asia/Shanghai)"; return 1; }
+    log_step "批量设置时区: ${tz}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 设置时区..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "timedatectl set-timezone ${tz} 2>/dev/null || ln -sf /usr/share/zoneinfo/${tz} /etc/localtime" || log_warning "[${host}] 时区设置失败"
+        }
+    done
+}
+
+# ============================================================================
+# 批量SSH密钥管理
+# ============================================================================
+
+batch_deploy_ssh_key() {
+    local key_file="${1:-${HOME}/.ssh/id_rsa.pub}"
+    [[ ! -f "${key_file}" ]] && { log_error "公钥文件不存在: ${key_file}"; return 1; }
+    local pub_key="$(cat "${key_file}")"
+    log_step "批量部署SSH公钥..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 部署SSH公钥..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${pub_key}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys" || log_warning "[${host}] SSH公钥部署失败"
+        }
+    done
+}
+
+batch_rotate_ssh_key() {
+    log_step "批量轮换SSH密钥..."
+    local key_type="${1:-ed25519}"
+    local key_comment="rotated-$(date +%Y%m%d)"
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 轮换SSH密钥..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "ssh-keygen -t ${key_type} -C '${key_comment}' -f ~/.ssh/id_${key_type} -N '' -q && cat ~/.ssh/id_${key_type}.pub" || log_warning "[${host}] SSH密钥轮换失败"
+        }
+    done
+}
+
+# ============================================================================
+# 批量系统更新与补丁管理
+# ============================================================================
+
+batch_security_update() {
+    log_step "批量安装安全更新..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 安装安全更新..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            local os_family="$(ssh_exec_cmd "${host}" "source /etc/os-release 2>/dev/null && echo \${ID}" 2>/dev/null)"
+            case "${os_family}" in
+                centos|rhel|rocky|almalinux)
+                    ssh_exec_cmd "${host}" "yum update --security -y 2>/dev/null || dnf update --security -y 2>/dev/null" || log_warning "[${host}] 安全更新失败"
+                    ;;
+                ubuntu|debian)
+                    ssh_exec_cmd "${host}" "apt-get update && unattended-upgrade -v 2>/dev/null || apt-get upgrade --with-new-pkgs -y 2>/dev/null" || log_warning "[${host}] 安全更新失败"
+                    ;;
+                *)
+                    ssh_exec_cmd "${host}" "echo '不支持自动安全更新'" || true
+                    ;;
+            esac
+        }
+    done
+}
+
+batch_kernel_update() {
+    log_step "批量更新内核..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 当前内核: $(ssh_exec_cmd "${host}" 'uname -r' 2>/dev/null)"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            local os_family="$(ssh_exec_cmd "${host}" "source /etc/os-release 2>/dev/null && echo \${ID}" 2>/dev/null)"
+            case "${os_family}" in
+                centos|rhel|rocky|almalinux)
+                    ssh_exec_cmd "${host}" "yum update kernel -y 2>/dev/null || dnf update kernel -y 2>/dev/null" || log_warning "[${host}] 内核更新失败"
+                    ;;
+                ubuntu|debian)
+                    ssh_exec_cmd "${host}" "apt-get update && apt-get install --only-upgrade linux-image-generic -y 2>/dev/null" || log_warning "[${host}] 内核更新失败"
+                    ;;
+                *)
+                    log_warning "[${host}] 不支持自动内核更新"
+                    ;;
+            esac
+        }
+    done
+}
+
+# ============================================================================
+# 批量配置备份
+# ============================================================================
+
+batch_backup_configs() {
+    local backup_dir="${1:-/tmp/config_backup_${TIMESTAMP}}"
+    log_step "批量备份配置文件到: ${backup_dir}..."
+    mkdir -p "${backup_dir}" 2>/dev/null || true
+
+    local config_paths="/etc/nginx /etc/ssh/sshd_config /etc/fstab /etc/hosts /etc/resolv.conf /etc/sysctl.conf /etc/crontab /etc/sudoers"
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 备份配置..."
+        local host_backup="${backup_dir}/${host}"
+        mkdir -p "${host_backup}" 2>/dev/null || true
+        for path in ${config_paths}; do
+            scp -P ${SSH_PORT} ${SSH_OPTIONS} -r "${SSH_USER}@${host}:${path}" "${host_backup}/" 2>/dev/null || true
+        done
+        log_success "[${host}] 配置已备份到: ${host_backup}"
+    done
+}
+
+# ============================================================================
+# 批量性能测试
+# ============================================================================
+
+batch_benchmark() {
+    log_step "批量性能测试..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 性能测试..."
+        ssh_exec_cmd "${host}" "echo '=== CPU ===' && sysbench cpu --time=10 run 2>/dev/null | grep 'total time' || echo 'sysbench未安装' && echo '=== Memory ===' && sysbench memory --time=10 run 2>/dev/null | grep 'total time' || echo 'sysbench未安装' && echo '=== Disk ===' && dd if=/dev/zero of=/tmp/bench bs=1M count=1024 oflag=dsync 2>&1 | tail -1 && rm -f /tmp/bench" || log_warning "[${host}] 性能测试失败"
+    done
+}
+
+# ============================================================================
+# 批量主机连通性报告
+# ============================================================================
+
+batch_connectivity_report() {
+    log_step "生成主机连通性报告..."
+    local report_file="${RESULT_DIR}/connectivity_report.txt"
+    local online=0 offline=0
+
+    echo "主机连通性报告 - $(date)" > "${report_file}"
+    echo "================================" >> "${report_file}"
+
+    for host in "${HOST_LIST[@]}"; do
+        if ping -c 1 -W 3 "${host}" &>/dev/null; then
+            echo "[在线] ${host}" >> "${report_file}"
+            ((online++)) || true
+        else
+            echo "[离线] ${host}" >> "${report_file}"
+            ((offline++)) || true
+        fi
+    done
+
+    echo "" >> "${report_file}"
+    echo "总计: ${#HOST_LIST[@]}台, 在线: ${online}台, 离线: ${offline}台" >> "${report_file}"
+    log_success "连通性报告: 在线${online}台, 离线${offline}台"
+    cat "${report_file}"
+}
+
+# ============================================================================
+# 批量主机标签管理
+# ============================================================================
+
+batch_label_hosts() {
+    local label="$1"
+    [[ -z "${label}" ]] && { log_error "请指定标签"; return 1; }
+    log_step "为主机添加标签: ${label}..."
+    local label_file="${SCRIPT_DIR}/host_labels.txt"
+    for host in "${HOST_LIST[@]}"; do
+        if grep -q "^${host}:" "${label_file}" 2>/dev/null; then
+            sed -i "s|^${host}:.*|${host}:${label}|" "${label_file}" 2>/dev/null || true
+        else
+            echo "${host}:${label}" >> "${label_file}"
+        fi
+        log_info "[${host}] 标签已设置: ${label}"
+    done
+}
+
+# ============================================================================
+# 批量SELinux/AppArmor管理
+# ============================================================================
+
+batch_selinux_manage() {
+    local action="$1"
+    [[ -z "${action}" ]] && { log_error "请指定操作 (status/enforce/permissive/disable)"; return 1; }
+    log_step "批量SELinux管理: ${action}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] SELinux ${action}..."
+        case "${action}" in
+            status)
+                ssh_exec_cmd "${host}" "getenforce 2>/dev/null || echo 'SELinux未安装'" || true
+                ;;
+            enforce)
+                [[ ${DRY_RUN} -eq 0 ]] && ssh_exec_cmd "${host}" "setenforce 1 2>/dev/null" || true
+                ;;
+            permissive)
+                [[ ${DRY_RUN} -eq 0 ]] && ssh_exec_cmd "${host}" "setenforce 0 2>/dev/null" || true
+                ;;
+            disable)
+                [[ ${DRY_RUN} -eq 0 ]] && ssh_exec_cmd "${host}" "sed -i 's/SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config 2>/dev/null" || true
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# 批量Swap管理
+# ============================================================================
+
+batch_swap_manage() {
+    local action="${1:-status}"
+    log_step "批量Swap管理: ${action}..."
+    for host in "${HOST_LIST[@]}"; do
+        case "${action}" in
+            status)
+                log_info "[${host}] Swap: $(ssh_exec_cmd "${host}" 'free -h | grep Swap' 2>/dev/null || echo '未知')"
+                ;;
+            off)
+                [[ ${DRY_RUN} -eq 0 ]] && ssh_exec_cmd "${host}" "swapoff -a 2>/dev/null" || true
+                ;;
+            on)
+                [[ ${DRY_RUN} -eq 0 ]] && ssh_exec_cmd "${host}" "swapon -a 2>/dev/null" || true
+                ;;
+            *)
+                log_warning "未知Swap操作: ${action}"
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# 批量系统限制管理
+# ============================================================================
+
+batch_set_ulimits() {
+    local limit_type="$1" value="$2"
+    [[ -z "${limit_type}" ]] && { log_error "请指定限制类型 (nofile/nproc等)"; return 1; }
+    log_step "批量设置系统限制: ${limit_type}=${value}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 设置${limit_type}..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "grep -q '^* soft ${limit_type}' /etc/security/limits.conf && sed -i 's|^* soft ${limit_type}.*|* soft ${limit_type} ${value}|' /etc/security/limits.conf || echo '* soft ${limit_type} ${value}' >> /etc/security/limits.conf; grep -q '^* hard ${limit_type}' /etc/security/limits.conf && sed -i 's|^* hard ${limit_type}.*|* hard ${limit_type} ${value}|' /etc/security/limits.conf || echo '* hard ${limit_type} ${value}' >> /etc/security/limits.conf" || log_warning "[${host}] 限制设置失败"
+        }
+    done
+}
+
+# ============================================================================
+# 批量DNS管理
+# ============================================================================
+
+batch_set_dns() {
+    local dns_server="$1"
+    [[ -z "${dns_server}" ]] && { log_error "请指定DNS服务器"; return 1; }
+    log_step "批量设置DNS: ${dns_server}..."
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 设置DNS..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "grep -q 'nameserver ${dns_server}' /etc/resolv.conf || echo 'nameserver ${dns_server}' >> /etc/resolv.conf" || log_warning "[${host}] DNS设置失败"
+        }
+    done
+}
+
+batch_dns_test() {
+    local domain="${1:-google.com}"
+    log_step "批量DNS解析测试: ${domain}..."
+    for host in "${HOST_LIST[@]}"; do
+        local result="$(ssh_exec_cmd "${host}" "nslookup ${domain} 2>/dev/null | grep 'Address' | tail -1" 2>/dev/null)"
+        if [[ -n "${result}" ]]; then
+            log_success "[${host}] ${domain} -> ${result}"
+        else
+            log_error "[${host}] ${domain} 解析失败"
+        fi
+    done
+}
+
+# ============================================================================
+# 批量主机密钥验证
+# ============================================================================
+
+batch_verify_host_keys() {
+    log_step "批量验证主机SSH密钥..."
+    for host in "${HOST_LIST[@]}"; do
+        local key_info="$(ssh-keyscan -p ${SSH_PORT} -t rsa,ecdsa,ed25519 "${host}" 2>/dev/null | head -3)"
+        if [[ -n "${key_info}" ]]; then
+            log_success "[${host}] SSH密钥有效"
+            [[ ${VERBOSE} -eq 1 ]] && echo "${key_info}"
+        else
+            log_warning "[${host}] SSH密钥获取失败"
+        fi
+    done
+}
+
+# ============================================================================
+# 批量主机重启管理
+# ============================================================================
+
+batch_reboot() {
+    log_step "批量重启主机..."
+    echo -e "${YELLOW}警告: 即将重启 ${#HOST_LIST[@]} 台主机!${NC}"
+    echo -ne "${YELLOW}确认重启? [yes/NO]: ${NC}"
+    read -r confirm
+    [[ "${confirm}" != "yes" ]] && { log_info "已取消"; return 0; }
+
+    for host in "${HOST_LIST[@]}"; do
+        log_info "[${host}] 发送重启命令..."
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            ssh_exec_cmd "${host}" "shutdown -r +1 'Batch reboot initiated'" || log_warning "[${host}] 重启命令发送失败"
+        }
+    done
+
+    log_info "等待主机重启..."
+    sleep 60
+
+    for host in "${HOST_LIST[@]}"; do
+        local retries=0
+        while [[ ${retries} -lt 10 ]]; do
+            if ssh_exec_cmd "${host}" "uptime" &>/dev/null; then
+                log_success "[${host}] 已重启并恢复"
+                break
+            fi
+            ((retries++)) || true
+            sleep 10
+        done
+        [[ ${retries} -ge 10 ]] && log_error "[${host}] 重启后未恢复"
+    done
+}
+
+# ============================================================================
+# 批量操作结果HTML报告
+# ============================================================================
+
+generate_html_report() {
+    log_step "生成HTML批量操作报告..."
+    local report_file="${RESULT_DIR}/batch_report_${TIMESTAMP}.html"
+
+    cat > "${report_file}" << REPORT_HEAD
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>批量操作报告 - ${TIMESTAMP}</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 2px solid #2196F3; padding-bottom: 10px; }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f5f5f5; }
+        .success { color: #4CAF50; }
+        .failed { color: #f44336; }
+        .warning { color: #FF9800; }
+        .stats { display: flex; gap: 20px; margin: 20px 0; }
+        .stat-card { background: #f8f9fa; padding: 15px 25px; border-radius: 6px; text-align: center; }
+        .stat-card h3 { margin: 0; color: #666; font-size: 14px; }
+        .stat-card .value { font-size: 28px; font-weight: bold; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>批量操作报告</h1>
+        <div class="stats">
+            <div class="stat-card"><h3>总主机</h3><div class="value">${STATS[total]:-0}</div></div>
+            <div class="stat-card"><h3>成功</h3><div class="value success">${STATS[success]:-0}</div></div>
+            <div class="stat-card"><h3>失败</h3><div class="value failed">${STATS[failed]:-0}</div></div>
+        </div>
+        <table>
+            <tr><th>主机</th><th>状态</th><th>输出摘要</th></tr>
+REPORT_HEAD
+
+    for host in "${HOST_LIST[@]}"; do
+        local result_file="${RESULT_DIR}/${host}.result"
+        local status="success"
+        local summary=""
+        if [[ -f "${result_file}" ]]; then
+            summary="$(tail -3 "${result_file}" | head -1 | cut -c1-100)"
+            grep -qi "error\|fail\|denied" "${result_file}" && status="failed"
+        else
+            status="failed"
+            summary="(无结果文件)"
+        fi
+        echo "            <tr><td>${host}</td><td class=\"${status}\">${status}</td><td>${summary}</td></tr>" >> "${report_file}"
+    done
+
+    cat >> "${report_file}" << REPORT_FOOT
+        </table>
+        <p style="color:#999;font-size:12px;margin-top:30px;">报告生成时间: $(date '+%Y-%m-%d %H:%M:%S') | Batch Process Script v${SCRIPT_VERSION}</p>
+    </div>
+</body>
+</html>
+REPORT_FOOT
+
+    log_success "HTML报告已生成: ${report_file}"
+}
+
+# ============================================================================
 # 参数解析
 # ============================================================================
 
@@ -903,6 +1853,33 @@ show_usage() {
   --security-check       批量安全检查
   --collect-logs [PATH]  批量日志收集
   --sync-config SRC DST  批量配置同步
+  --docker-ps            批量查看Docker容器
+  --docker-pull IMAGE    批量拉取Docker镜像
+  --docker-cleanup       批量清理Docker资源
+  --disk-usage           批量检查磁盘使用
+  --find-large [SIZE]    批量查找大文件
+  --network-info         批量获取网络信息
+  --port-check PORT      批量检查端口
+  --ping-test            批量Ping测试
+  --process-list [PAT]   批量查看进程
+  --system-info          批量收集系统信息
+  --cron-list            批量列出Cron任务
+  --cron-add ENTRY       批量添加Cron任务
+  --cron-remove PATTERN  批量删除Cron任务
+  --time-sync            批量时间同步
+  --deploy-ssh-key [KEY] 批量部署SSH公钥
+  --security-update      批量安装安全更新
+  --backup-configs [DIR] 批量备份配置文件
+  --connectivity-report  生成连通性报告
+  --html-report          生成HTML操作报告
+  --reboot               批量重启主机
+  --asset-inventory       批量主机资产登记
+  --compliance-check      批量合规检查
+  --analyze-logs [PATH]   批量日志分析
+  --check-certs           批量SSL证书检查
+  --check-sysctl [PARAM]  批量内核参数检查
+  --config-diff PATH      批量配置差异检测
+  --load-check            批量负载检查
 
 选项:
   --hosts FILE       主机清单文件 (必须)
@@ -925,41 +1902,67 @@ USAGE
 
 parse_args() {
     [[ $# -eq 0 ]] && { show_usage; exit 0; }
-    local action="" action_arg=""
+    local action="" action_arg="" action_arg2=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hosts)        INVENTORY_FILE="$2"; shift ;;
-            --group)        INVENTORY_GROUP="$2"; shift ;;
-            --filter)       HOST_FILTER="$2"; shift ;;
-            --user)         SSH_USER="$2"; shift ;;
-            --port)         SSH_PORT="$2"; shift ;;
-            --key)          SSH_KEY="$2"; shift ;;
-            --parallel)     PARALLEL="$2"; shift ;;
-            --timeout)      COMMAND_TIMEOUT="$2"; shift ;;
-            --dry-run)      DRY_RUN=1 ;;
-            --verbose)      VERBOSE=1 ;;
-            --exec)         action="exec"; action_arg="$2"; shift ;;
-            --exec-script)  action="exec_script"; action_arg="$2"; shift ;;
-            --copy-local)   action="copy_local"; action_arg="$2"; shift; action_arg2="$2"; shift ;;
-            --copy-remote)  action="copy_remote"; action_arg="$2"; shift; action_arg2="$2"; shift ;;
-            --rsync)        action="rsync"; action_arg="$2"; shift; action_arg2="$2"; shift ;;
-            --install)      action="install"; action_arg="$2"; shift ;;
-            --update)       action="update" ;;
-            --remove)       action="remove"; action_arg="$2"; shift ;;
-            --service)      action="service"; action_arg="$2"; shift; action_arg2="$2"; shift ;;
-            --user-add)     action="user_add"; action_arg="$2"; shift ;;
-            --user-del)     action="user_del"; action_arg="$2"; shift ;;
-            --check)        action="check" ;;
-            --monitor)      action="monitor" ;;
-            --security-check) action="security_check" ;;
-            --collect-logs) action="collect_logs"; action_arg="${2:-/var/log}" ;;
-            --sync-config)  action="sync_config"; action_arg="$2"; shift; action_arg2="$2"; shift ;;
+            --hosts)        INVENTORY_FILE="$2"; shift 2 ;;
+            --group)        INVENTORY_GROUP="$2"; shift 2 ;;
+            --filter)       HOST_FILTER="$2"; shift 2 ;;
+            --user)         SSH_USER="$2"; shift 2 ;;
+            --port)         SSH_PORT="$2"; shift 2 ;;
+            --key)          SSH_KEY="$2"; shift 2 ;;
+            --parallel)     PARALLEL="$2"; shift 2 ;;
+            --timeout)      COMMAND_TIMEOUT="$2"; shift 2 ;;
+            --dry-run)      DRY_RUN=1; shift ;;
+            --verbose)      VERBOSE=1; shift ;;
+            --exec)         action="exec"; action_arg="$2"; shift 2 ;;
+            --exec-script)  action="exec_script"; action_arg="$2"; shift 2 ;;
+            --copy-local)   action="copy_local"; action_arg="$2"; action_arg2="$3"; shift 3 ;;
+            --copy-remote)  action="copy_remote"; action_arg="$2"; action_arg2="$3"; shift 3 ;;
+            --rsync)        action="rsync"; action_arg="$2"; action_arg2="$3"; shift 3 ;;
+            --install)      action="install"; action_arg="$2"; shift 2 ;;
+            --update)       action="update"; shift ;;
+            --remove)       action="remove"; action_arg="$2"; shift 2 ;;
+            --service)      action="service"; action_arg="$2"; action_arg2="$3"; shift 3 ;;
+            --user-add)     action="user_add"; action_arg="$2"; shift 2 ;;
+            --user-del)     action="user_del"; action_arg="$2"; shift 2 ;;
+            --check)        action="check"; shift ;;
+            --monitor)      action="monitor"; shift ;;
+            --security-check) action="security_check"; shift ;;
+            --collect-logs) action="collect_logs"; action_arg="${2:-/var/log}"; [[ $# -gt 1 ]] && shift 2 || shift ;;
+            --sync-config)  action="sync_config"; action_arg="$2"; action_arg2="$3"; shift 3 ;;
+            --docker-ps)    action="docker_ps"; shift ;;
+            --docker-pull)  action="docker_pull"; action_arg="$2"; shift 2 ;;
+            --docker-cleanup) action="docker_cleanup"; shift ;;
+            --disk-usage)   action="disk_usage"; shift ;;
+            --find-large)   action="find_large"; action_arg="${2:-100M}"; [[ $# -gt 1 && ! "$2" =~ ^-- ]] && shift 2 || shift ;;
+            --network-info) action="network_info"; shift ;;
+            --port-check)   action="port_check"; action_arg="$2"; shift 2 ;;
+            --ping-test)    action="ping_test"; shift ;;
+            --process-list) action="process_list"; action_arg="${2:-}"; [[ $# -gt 1 && ! "$2" =~ ^-- ]] && shift 2 || shift ;;
+            --system-info)  action="system_info"; shift ;;
+            --cron-list)    action="cron_list"; shift ;;
+            --cron-add)     action="cron_add"; action_arg="$2"; shift 2 ;;
+            --cron-remove)  action="cron_remove"; action_arg="$2"; shift 2 ;;
+            --time-sync)    action="time_sync"; shift ;;
+            --deploy-ssh-key) action="deploy_ssh_key"; action_arg="${2:-${HOME}/.ssh/id_rsa.pub}"; [[ $# -gt 1 && ! "$2" =~ ^-- ]] && shift 2 || shift ;;
+            --security-update) action="security_update"; shift ;;
+            --backup-configs) action="backup_configs"; action_arg="${2:-/tmp/config_backup_${TIMESTAMP}}"; [[ $# -gt 1 && ! "$2" =~ ^-- ]] && shift 2 || shift ;;
+            --connectivity-report) action="connectivity_report"; shift ;;
+            --html-report)  action="html_report"; shift ;;
+            --reboot)       action="reboot"; shift ;;
+            --asset-inventory) action="asset_inventory"; shift ;;
+            --compliance-check) action="compliance_check"; shift ;;
+            --analyze-logs) action="analyze_logs"; action_arg="${2:-/var/log/syslog}"; [[ $# -gt 1 && ! "$2" =~ ^-- ]] && shift 2 || shift ;;
+            --check-certs)  action="check_certs"; shift ;;
+            --check-sysctl) action="check_sysctl"; action_arg="${2:-}"; [[ $# -gt 1 && ! "$2" =~ ^-- ]] && shift 2 || shift ;;
+            --config-diff)  action="config_diff"; action_arg="$2"; shift 2 ;;
+            --load-check)   action="load_check"; shift ;;
             --help|-h)      show_usage; exit 0 ;;
             --version|-v)   echo "v${SCRIPT_VERSION}"; exit 0 ;;
             *)              log_error "未知选项: $1"; show_usage; exit 1 ;;
         esac
-        shift
     done
 
     [[ -z "${INVENTORY_FILE}" ]] && die "必须指定主机清单文件 (--hosts)"
@@ -988,8 +1991,41 @@ parse_args() {
         security_check) batch_security_check ;;
         collect_logs)  batch_collect_logs "${action_arg}" ;;
         sync_config)   batch_sync_config "${action_arg}" "${action_arg2}" ;;
+        docker_ps)     batch_docker_ps ;;
+        docker_pull)   batch_docker_pull "${action_arg}" ;;
+        docker_cleanup) batch_docker_cleanup ;;
+        disk_usage)    batch_disk_usage ;;
+        find_large)    batch_find_large_files "${action_arg}" ;;
+        network_info)  batch_network_info ;;
+        port_check)    batch_port_check "${action_arg}" ;;
+        ping_test)     batch_ping_test ;;
+        process_list)  batch_process_list "${action_arg}" ;;
+        system_info)   batch_system_info ;;
+        cron_list)     batch_cron_list ;;
+        cron_add)      batch_cron_add "${action_arg}" ;;
+        cron_remove)   batch_cron_remove "${action_arg}" ;;
+        time_sync)     batch_time_sync ;;
+        deploy_ssh_key) batch_deploy_ssh_key "${action_arg}" ;;
+        security_update) batch_security_update ;;
+        backup_configs) batch_backup_configs "${action_arg}" ;;
+        connectivity_report) batch_connectivity_report ;;
+        html_report)   generate_html_report ;;
+        reboot)        batch_reboot ;;
+        asset_inventory) batch_asset_inventory ;;
+        compliance_check) batch_compliance_check ;;
+        analyze_logs)  batch_analyze_logs "${action_arg}" ;;
+        check_certs)   batch_check_certificates ;;
+        check_sysctl)  batch_check_sysctl "${action_arg}" ;;
+        config_diff)   batch_config_diff "${action_arg}" ;;
+        load_check)    batch_load_check ;;
         *)             die "未指定操作"; ;;
     esac
+
+    batch_summary
 }
+
+# ============================================================================
+# 脚本入口
+# ============================================================================
 
 parse_args "$@"

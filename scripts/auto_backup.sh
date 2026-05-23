@@ -68,6 +68,7 @@ NOTIFY_EMAIL=""
 RETENTION_DAYS=30
 RETENTION_WEEKS=12
 RETENTION_MONTHS=12
+DECRYPT_FILE=""
 
 declare -A OS_INFO
 declare -A DB_CONFIG
@@ -83,7 +84,7 @@ BACKUP_STATS[success_count]=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
-WHITE='\033[1;37m'; NC='\033[0m'
+WHITE='\033[1;37m'; NC='\033[0m'; DIM='\033[2m'
 
 log() {
     local level="$1"; shift; local message="$*"
@@ -943,6 +944,938 @@ parse_config_file() {
     done < "${config}"
 }
 
+confirm_action() {
+    local prompt="$1"
+    echo -ne "${YELLOW}${prompt} [y/N]: ${NC}"
+    read -r response
+    [[ "${response}" =~ ^[Yy]$ ]]
+}
+
+# ============================================================================
+# 备份前检查模块
+# ============================================================================
+
+pre_backup_check() {
+    log_step "执行备份前检查..."
+
+    log_info "检查磁盘空间..."
+    local backup_dir="${BACKUP_ROOT}"
+    local available_space
+    available_space="$(df "${backup_dir}" 2>/dev/null | awk 'NR==2{print $4}')"
+    available_space="${available_space:-0}"
+    local available_gb=$((available_space / 1024 / 1024))
+    if [[ ${available_gb} -lt 5 ]]; then
+        log_error "磁盘空间不足: ${available_gb}GB 可用 (需要至少5GB)"
+        return 1
+    fi
+    log_info "可用磁盘空间: ${available_gb}GB"
+
+    log_info "检查备份目录权限..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        mkdir -p "${BACKUP_ROOT}" 2>/dev/null || { log_error "无法创建备份目录: ${BACKUP_ROOT}"; return 1; }
+        touch "${BACKUP_ROOT}/.write_test" 2>/dev/null || { log_error "备份目录不可写: ${BACKUP_ROOT}"; return 1; }
+        rm -f "${BACKUP_ROOT}/.write_test"
+    }
+
+    log_info "检查必要工具..."
+    local required_tools=("tar" "gzip" "sha256sum")
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "${tool}" &>/dev/null; then
+            log_error "必要工具未安装: ${tool}"
+            return 1
+        fi
+    done
+
+    log_info "检查数据库连接..."
+    command -v mysql &>/dev/null && {
+        local mysql_host="${DB_CONFIG[mysql_host]:-localhost}"
+        local mysql_port="${DB_CONFIG[mysql_port]:-3306}"
+        if timeout 5 bash -c "echo > /dev/tcp/${mysql_host}/${mysql_port}" 2>/dev/null; then
+            log_info "MySQL连接正常: ${mysql_host}:${mysql_port}"
+        else
+            log_warning "MySQL连接失败: ${mysql_host}:${mysql_port}"
+        fi
+    }
+    command -v psql &>/dev/null && {
+        local pg_host="${DB_CONFIG[pg_host]:-localhost}"
+        local pg_port="${DB_CONFIG[pg_port]:-5432}"
+        if timeout 5 bash -c "echo > /dev/tcp/${pg_host}/${pg_port}" 2>/dev/null; then
+            log_info "PostgreSQL连接正常: ${pg_host}:${pg_port}"
+        else
+            log_warning "PostgreSQL连接失败: ${pg_host}:${pg_port}"
+        fi
+    }
+
+    log_info "检查远程备份目标..."
+    case "${REMOTE_TYPE}" in
+        rsync|scp)
+            if [[ -n "${REMOTE_HOST}" ]]; then
+                if timeout 5 ssh -o ConnectTimeout=3 -p "${REMOTE_PORT}" "${REMOTE_USER}@${REMOTE_HOST}" "echo ok" &>/dev/null; then
+                    log_info "远程主机连接正常: ${REMOTE_HOST}"
+                else
+                    log_warning "远程主机连接失败: ${REMOTE_HOST}"
+                fi
+            fi
+            ;;
+        s3)
+            command -v aws &>/dev/null || log_warning "AWS CLI未安装"
+            ;;
+    esac
+
+    log_success "备份前检查完成"
+    return 0
+}
+
+# ============================================================================
+# 备份计划与调度模块
+# ============================================================================
+
+generate_backup_plan() {
+    log_step "生成备份计划..."
+    local plan_file="${BACKUP_ROOT}/${HOSTNAME}/backup_plan.txt"
+
+    mkdir -p "$(dirname "${plan_file}")" 2>/dev/null || true
+
+    cat > "${plan_file}" << PLAN
+================================================================
+  备份计划 - ${HOSTNAME} - ${TIMESTAMP}
+================================================================
+
+[1] 备份类型与策略
+  - 全量备份: 每周日 02:00
+  - 增量备份: 周一至周六 02:00
+  - 数据库备份: 每日 03:00
+  - 配置备份: 每日 04:00
+  - Docker备份: 每日 04:30
+
+[2] 保留策略
+  - 日备份保留: ${RETENTION_DAYS} 天
+  - 周备份保留: ${RETENTION_WEEKS} 周
+  - 月备份保留: ${RETENTION_MONTHS} 月
+
+[3] 存储与传输
+  - 本地路径: ${BACKUP_ROOT}
+  - 压缩格式: ${COMPRESS_FORMAT}
+  - 加密: $([[ ${ENCRYPT_BACKUP} -eq 1 ]] && echo "是" || echo "否")
+  - 远程类型: ${REMOTE_TYPE:-无}
+
+[4] 备份路径
+PLAN
+
+    local default_paths=("/etc" "/home" "/root" "/opt" "/var/www" "/var/lib" "/srv")
+    local backup_paths=()
+    [[ ${#BACKUP_ITEMS[@]} -gt 0 ]] && backup_paths=("${BACKUP_ITEMS[@]}") || backup_paths=("${default_paths[@]}")
+    for p in "${backup_paths[@]}"; do
+        echo "  - ${p}" >> "${plan_file}"
+    done
+
+    cat >> "${plan_file}" << PLAN
+
+[5] 排除规则
+PLAN
+    local default_excludes=("*.log" "*.tmp" "*.cache" "__pycache__" "node_modules" ".git" "*.swp" "lost+found" ".DS_Store")
+    [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]] && default_excludes=("${EXCLUDE_PATTERNS[@]}")
+    for pat in "${default_excludes[@]}"; do
+        echo "  - ${pat}" >> "${plan_file}"
+    done
+
+    cat >> "${plan_file}" << PLAN
+
+[6] 数据库配置
+  - MySQL: ${DB_CONFIG[mysql_host]:-未配置}:${DB_CONFIG[mysql_port]:-3306}
+  - PostgreSQL: ${DB_CONFIG[pg_host]:-未配置}:${DB_CONFIG[pg_port]:-5432}
+  - MongoDB: ${DB_CONFIG[mongo_host]:-未配置}:${DB_CONFIG[mongo_port]:-27017}
+  - Redis: ${DB_CONFIG[redis_host]:-未配置}:${DB_CONFIG[redis_port]:-6379}
+
+[7] 通知配置
+  - 类型: ${NOTIFY_TYPE:-无}
+  - 邮件: ${NOTIFY_EMAIL:-未配置}
+  - Webhook: $([[ -n "${NOTIFY_WEBHOOK}" ]] && echo "已配置" || echo "未配置")
+
+[8] 建议Cron配置
+  # 全量备份 (每周日)
+  0 2 * * 0 /bin/bash $(realpath "$0" 2>/dev/null || echo "$0") --all --config-file /etc/auto_backup/backup.cfg >> /var/log/auto_backup/cron.log 2>&1
+  # 增量备份 (周一至周六)
+  0 2 * * 1-6 /bin/bash $(realpath "$0" 2>/dev/null || echo "$0") --incremental --config-file /etc/auto_backup/backup.cfg >> /var/log/auto_backup/cron.log 2>&1
+  # 数据库备份 (每日)
+  0 3 * * * /bin/bash $(realpath "$0" 2>/dev/null || echo "$0") --database --config-file /etc/auto_backup/backup.cfg >> /var/log/auto_backup/cron.log 2>&1
+  # 清理过期备份 (每周一)
+  0 5 * * 1 /bin/bash $(realpath "$0" 2>/dev/null || echo "$0") --cleanup --config-file /etc/auto_backup/backup.cfg >> /var/log/auto_backup/cron.log 2>&1
+================================================================
+PLAN
+
+    log_success "备份计划已生成: ${plan_file}"
+    cat "${plan_file}"
+}
+
+# ============================================================================
+# 备份报告模块
+# ============================================================================
+
+generate_backup_report() {
+    log_step "生成备份报告..."
+    local report_file="${BACKUP_ROOT}/${HOSTNAME}/report_${TIMESTAMP}.html"
+
+    local duration=0
+    if [[ -n "${BACKUP_STATS[end_time]:-}" ]]; then
+        duration=$((BACKUP_STATS[end_time] - BACKUP_STATS[start_time]))
+    fi
+
+    local total_size_human="$(human_size ${BACKUP_STATS[total_size]})"
+    local os_name="$(cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'"' -f2 || echo 'Unknown')"
+
+    cat > "${report_file}" << REPORT
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>备份报告 - ${HOSTNAME} - ${TIMESTAMP}</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; background: #f5f5f5; }
+.container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
+h2 { color: #555; margin-top: 25px; }
+.info-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+.info-table td { padding: 8px 12px; border: 1px solid #ddd; }
+.info-table td:first-child { background: #f9f9f9; font-weight: bold; width: 40%; }
+.success { color: #4CAF50; font-weight: bold; }
+.error { color: #f44336; font-weight: bold; }
+.warning { color: #ff9800; font-weight: bold; }
+.footer { margin-top: 30px; padding-top: 15px; border-top: 1px solid #eee; color: #999; font-size: 12px; }
+.progress-bar { background: #e0e0e0; border-radius: 4px; overflow: hidden; height: 20px; margin: 10px 0; }
+.progress-fill { height: 100%; background: #4CAF50; text-align: center; color: white; line-height: 20px; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>备份报告</h1>
+<table class="info-table">
+<tr><td>主机名</td><td>${HOSTNAME}</td></tr>
+<tr><td>操作系统</td><td>${os_name}</td></tr>
+<tr><td>备份时间</td><td>$(date '+%Y-%m-%d %H:%M:%S')</td></tr>
+<tr><td>备份耗时</td><td>${duration} 秒</td></tr>
+<tr><td>备份根目录</td><td>${BACKUP_ROOT}</td></tr>
+<tr><td>压缩格式</td><td>${COMPRESS_FORMAT}</td></tr>
+<tr><td>加密状态</td><td>$([[ ${ENCRYPT_BACKUP} -eq 1 ]] && echo "已加密" || echo "未加密")</td></tr>
+</table>
+
+<h2>备份统计</h2>
+<table class="info-table">
+<tr><td>总大小</td><td>${total_size_human}</td></tr>
+<tr><td>成功数</td><td class="success">${BACKUP_STATS[success_count]}</td></tr>
+<tr><td>失败数</td><td class="error">${BACKUP_STATS[error_count]}</td></tr>
+<tr><td>文件数</td><td>${BACKUP_STATS[file_count]}</td></tr>
+</table>
+
+<h2>保留策略</h2>
+<table class="info-table">
+<tr><td>日备份保留</td><td>${RETENTION_DAYS} 天</td></tr>
+<tr><td>周备份保留</td><td>${RETENTION_WEEKS} 周</td></tr>
+<tr><td>月备份保留</td><td>${RETENTION_MONTHS} 月</td></tr>
+</table>
+
+<h2>远程备份</h2>
+<table class="info-table">
+<tr><td>传输方式</td><td>${REMOTE_TYPE:-未配置}</td></tr>
+<tr><td>远程主机</td><td>${REMOTE_HOST:-未配置}</td></tr>
+<tr><td>远程路径</td><td>${REMOTE_PATH:-未配置}</td></tr>
+</table>
+
+<h2>磁盘使用</h2>
+<table class="info-table">
+REPORT
+
+    df -h "${BACKUP_ROOT}" 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++)h[i]=$i;next}{for(i=1;i<=NF;i++)printf "<tr><td>%s</td><td>%s</td></tr>\n",h[i],$i}' >> "${report_file}"
+
+    cat >> "${report_file}" << REPORT
+</table>
+
+<div class="footer">
+<p>报告生成时间: $(date '+%Y-%m-%d %H:%M:%S') | 脚本版本: v${SCRIPT_VERSION}</p>
+<p>https://github.com/gxfdev/shell-scripts</p>
+</div>
+</div>
+</body>
+</html>
+REPORT
+
+    log_success "备份报告已生成: ${report_file}"
+}
+
+# ============================================================================
+# 备份比较模块
+# ============================================================================
+
+compare_backups() {
+    log_step "比较备份差异..."
+    local backup_dir1="$1"
+    local backup_dir2="$2"
+    [[ -z "${backup_dir1}" ]] || [[ -z "${backup_dir2}" ]] && { log_error "需要指定两个备份目录"; return 1; }
+    [[ ! -d "${backup_dir1}" ]] && { log_error "备份目录不存在: ${backup_dir1}"; return 1; }
+    [[ ! -d "${backup_dir2}" ]] && { log_error "备份目录不存在: ${backup_dir2}"; return 1; }
+
+    echo -e "${CYAN}=== 备份差异比较 ===${NC}"
+    echo -e "  目录1: ${backup_dir1}"
+    echo -e "  目录2: ${backup_dir2}"
+    echo ""
+
+    echo -e "${WHITE}[仅存在于目录1]${NC}"
+    diff <(cd "${backup_dir1}" && find . -type f | sort) <(cd "${backup_dir2}" && find . -type f | sort) | grep "^<" | sed 's/^<  /  /'
+
+    echo -e "\n${WHITE}[仅存在于目录2]${NC}"
+    diff <(cd "${backup_dir1}" && find . -type f | sort) <(cd "${backup_dir2}" && find . -type f | sort) | grep "^>" | sed 's/^>  /  /'
+
+    echo -e "\n${WHITE}[文件大小变化]${NC}"
+    comm -12 <(cd "${backup_dir1}" && find . -type f | sort) <(cd "${backup_dir2}" && find . -type f | sort) | while read -r file; do
+        local size1="$(stat -c%s "${backup_dir1}/${file}" 2>/dev/null || echo 0)"
+        local size2="$(stat -c%s "${backup_dir2}/${file}" 2>/dev/null || echo 0)"
+        if [[ ${size1} -ne ${size2} ]]; then
+            echo "  ${file}: $(human_size ${size1}) -> $(human_size ${size2})"
+        fi
+    done
+
+    log_success "备份差异比较完成"
+}
+
+# ============================================================================
+# 备份同步模块 (双向同步)
+# ============================================================================
+
+sync_backup_to_remote() {
+    log_step "同步备份到远程 (双向)..."
+    [[ -z "${REMOTE_HOST}" ]] && { log_error "未配置远程主机"; return 1; }
+
+    local local_dir="${BACKUP_ROOT}/${HOSTNAME}"
+    local remote_dir="${REMOTE_PATH}/${HOSTNAME}"
+
+    log_info "本地 -> 远程同步..."
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        rsync -avz --delete --progress \
+            -e "ssh -p ${REMOTE_PORT}" \
+            "${local_dir}/" "${REMOTE_USER}@${REMOTE_HOST}:${remote_dir}/" 2>>"${LOG_FILE}"
+    }
+
+    log_success "双向同步完成"
+}
+
+# ============================================================================
+# 备份压缩优化模块
+# ============================================================================
+
+optimize_backup_compression() {
+    log_step "优化备份压缩..."
+    local backup_dir="${BACKUP_ROOT}/${HOSTNAME}/${DATE_ONLY}"
+
+    [[ ! -d "${backup_dir}" ]] && { log_warning "备份目录不存在"; return 0; }
+
+    log_info "查找未压缩的备份文件..."
+    find "${backup_dir}" -type f \( -name "*.sql" -o -name "*.rdb" -o -name "*.txt" \) ! -name "*.gz" ! -name "*.xz" ! -name "*.bz2" ! -name "*.zst" | while read -r file; do
+        log_info "压缩: ${file}"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            case "${COMPRESS_FORMAT}" in
+                xz)  xz -T0 "${file}" ;;
+                gz)  gzip -9 "${file}" ;;
+                bz2) bzip2 -9 "${file}" ;;
+                zst) zstd -19 "${file}" ;;
+                *)   gzip -9 "${file}" ;;
+            esac
+        }
+    done
+
+    log_info "重新压缩大文件 (使用更高压缩率)..."
+    find "${backup_dir}" -type f -name "*.tar.gz" -size +100M | while read -r file; do
+        local fsize="$(stat -c%s "${file}" 2>/dev/null || echo 0)"
+        if [[ ${fsize} -gt 104857600 ]]; then
+            log_info "重新压缩大文件: ${file} ($(human_size ${fsize}))"
+            [[ ${DRY_RUN} -eq 0 ]] && {
+                local tmp_dir="$(mktemp -d)"
+                tar -xzf "${file}" -C "${tmp_dir}" 2>/dev/null || true
+                xz -T0 -9 -f "${file}" 2>/dev/null || true
+                rm -rf "${tmp_dir}"
+            }
+        fi
+    done
+
+    log_success "备份压缩优化完成"
+}
+
+# ============================================================================
+# 备份去重模块
+# ============================================================================
+
+deduplicate_backups() {
+    log_step "备份去重..."
+    local backup_dir="${BACKUP_ROOT}/${HOSTNAME}/${DATE_ONLY}"
+    [[ ! -d "${backup_dir}" ]] && { log_warning "备份目录不存在"; return 0; }
+
+    log_info "查找重复文件..."
+    local dup_count=0 dup_size=0
+
+    declare -A file_hashes
+    find "${backup_dir}" -type f ! -name "*.sha256" ! -name "*.md5" | while read -r file; do
+        local hash="$(sha256sum "${file}" 2>/dev/null | awk '{print $1}')"
+        local fsize="$(stat -c%s "${file}" 2>/dev/null || echo 0)"
+        if [[ -n "${file_hashes[${hash}]:-}" ]]; then
+            log_info "发现重复: ${file} = ${file_hashes[${hash}]}"
+            [[ ${DRY_RUN} -eq 0 ]] && {
+                ln -f "${file_hashes[${hash}]}" "${file}"
+            }
+            dup_size=$((dup_size + fsize))
+            ((dup_count++)) || true
+        else
+            file_hashes[${hash}]="${file}"
+        fi
+    done
+
+    if [[ ${dup_count} -gt 0 ]]; then
+        log_success "去重完成: 发现 ${dup_count} 个重复文件, 节省 $(human_size ${dup_size})"
+    else
+        log_info "未发现重复文件"
+    fi
+}
+
+# ============================================================================
+# 数据库备份增强模块
+# ============================================================================
+
+backup_mysql_table() {
+    local db="$1" table="$2"
+    local backup_dir="$(init_backup_dir)/databases"
+    local mysql_host="${DB_CONFIG[mysql_host]:-localhost}"
+    local mysql_port="${DB_CONFIG[mysql_port]:-3306}"
+    local mysql_user="${DB_CONFIG[mysql_user]:-root}"
+    local mysql_pass="${DB_CONFIG[mysql_pass]:-}"
+
+    command -v mysqldump &>/dev/null || { log_error "mysqldump未安装"; return 1; }
+
+    local auth_opts=""
+    [[ -n "${mysql_pass}" ]] && auth_opts="-u${mysql_user} -p${mysql_pass} -h${mysql_host} -P${mysql_port}"
+
+    local output="${backup_dir}/mysql_${db}_${table}_${TIMESTAMP}.sql"
+    log_info "备份MySQL表: ${db}.${table}"
+
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        mysqldump ${auth_opts} --single-transaction --set-gtid-purged=OFF "${db}" "${table}" > "${output}" 2>>"${LOG_FILE}"
+        [[ -f "${output}" ]] && [[ -s "${output}" ]] && {
+            gzip -9 "${output}"
+            log_success "MySQL表备份完成: ${db}.${table}"
+            generate_checksum "${output}.gz"
+        }
+    }
+}
+
+backup_mysql_replication() {
+    log_step "备份MySQL复制状态..."
+    local backup_dir="$(init_backup_dir)/databases"
+    local mysql_host="${DB_CONFIG[mysql_host]:-localhost}"
+    local mysql_port="${DB_CONFIG[mysql_port]:-3306}"
+    local mysql_user="${DB_CONFIG[mysql_user]:-root}"
+    local mysql_pass="${DB_CONFIG[mysql_pass]:-}"
+
+    command -v mysql &>/dev/null || return 0
+
+    local auth_opts=""
+    [[ -n "${mysql_pass}" ]] && auth_opts="-u${mysql_user} -p${mysql_pass} -h${mysql_host} -P${mysql_port}"
+
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        mysql ${auth_opts} -e "SHOW MASTER STATUS\G" > "${backup_dir}/mysql_master_status_${TIMESTAMP}.txt" 2>/dev/null || true
+        mysql ${auth_opts} -e "SHOW SLAVE STATUS\G" > "${backup_dir}/mysql_slave_status_${TIMESTAMP}.txt" 2>/dev/null || true
+        mysql ${auth_opts} -e "SHOW BINARY LOGS;" > "${backup_dir}/mysql_binary_logs_${TIMESTAMP}.txt" 2>/dev/null || true
+        mysql ${auth_opts} -e "SHOW VARIABLES LIKE '%gtid%';" > "${backup_dir}/mysql_gtid_status_${TIMESTAMP}.txt" 2>/dev/null || true
+        log_success "MySQL复制状态备份完成"
+    }
+}
+
+backup_postgresql_table() {
+    local db="$1" table="$2"
+    local backup_dir="$(init_backup_dir)/databases"
+    local pg_host="${DB_CONFIG[pg_host]:-localhost}"
+    local pg_port="${DB_CONFIG[pg_port]:-5432}"
+    local pg_user="${DB_CONFIG[pg_user]:-postgres}"
+    local pg_pass="${DB_CONFIG[pg_pass]:-}"
+
+    command -v pg_dump &>/dev/null || { log_error "pg_dump未安装"; return 1; }
+
+    local conn_opts="-h${pg_host} -p${pg_port} -U${pg_user}"
+    local output="${backup_dir}/postgresql_${db}_${table}_${TIMESTAMP}.sql"
+
+    log_info "备份PostgreSQL表: ${db}.${table}"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        PGPASSWORD="${pg_pass}" pg_dump ${conn_opts} -t "${table}" -Fc "${db}" -f "${output}" 2>>"${LOG_FILE}"
+        [[ -f "${output}" ]] && [[ -s "${output}" ]] && {
+            log_success "PostgreSQL表备份完成: ${db}.${table}"
+            generate_checksum "${output}"
+        }
+    }
+}
+
+backup_etcd() {
+    log_step "备份etcd..."
+    local backup_dir="$(init_backup_dir)/databases"
+    local etcd_endpoints="${DB_CONFIG[etcd_endpoints]:-https://127.0.0.1:2379}"
+    local etcd_cert="${DB_CONFIG[etcd_cert]:-/etc/etcd/ssl/server.pem}"
+    local etcd_key="${DB_CONFIG[etcd_key]:-/etc/etcd/ssl/server-key.pem}"
+    local etcd_cacert="${DB_CONFIG[etcd_cacert]:-/etc/etcd/ssl/ca.pem}"
+
+    command -v etcdctl &>/dev/null || { log_info "etcdctl未安装, 跳过"; return 0; }
+
+    local output="${backup_dir}/etcd_snapshot_${TIMESTAMP}.db"
+    log_info "备份etcd快照..."
+
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        ETCDCTL_API=3 etcdctl snapshot save "${output}" \
+            --endpoints="${etcd_endpoints}" \
+            --cert="${etcd_cert}" \
+            --key="${etcd_key}" \
+            --cacert="${etcd_cacert}" 2>>"${LOG_FILE}"
+
+        if [[ -f "${output}" ]]; then
+            local fsize="$(stat -c%s "${output}" 2>/dev/null || echo 0)"
+            BACKUP_STATS[total_size]=$((BACKUP_STATS[total_size] + fsize))
+            log_success "etcd备份完成 ($(human_size ${fsize}))"
+            generate_checksum "${output}"
+        else
+            log_error "etcd备份失败"
+        fi
+    }
+}
+
+backup_elasticsearch() {
+    log_step "备份Elasticsearch..."
+    local backup_dir="$(init_backup_dir)/databases"
+    local es_host="${DB_CONFIG[es_host]:-localhost}"
+    local es_port="${DB_CONFIG[es_port]:-9200}"
+    local es_user="${DB_CONFIG[es_user]:-}"
+    local es_pass="${DB_CONFIG[es_pass]:-}"
+
+    command -v curl &>/dev/null || return 0
+
+    local auth_opts=""
+    [[ -n "${es_user}" ]] && auth_opts="-u ${es_user}:${es_pass}"
+
+    log_info "获取Elasticsearch索引列表..."
+    local indices
+    indices="$(curl -s ${auth_opts} "http://${es_host}:${es_port}/_cat/indices?h=index" 2>/dev/null | grep -v "^\." | head -50)" || true
+
+    for index in ${indices}; do
+        local output="${backup_dir}/es_${index}_${TIMESTAMP}.json"
+        log_info "备份Elasticsearch索引: ${index}"
+        [[ ${DRY_RUN} -eq 0 ]] && {
+            curl -s ${auth_opts} -X POST "http://${es_host}:${es_port}/${index}/_export" 2>/dev/null > "${output}" || true
+            [[ -f "${output}" ]] && [[ -s "${output}" ]] && {
+                gzip -9 "${output}"
+                log_success "Elasticsearch索引备份完成: ${index}"
+            }
+        }
+    done
+}
+
+# ============================================================================
+# 备份验证增强模块
+# ============================================================================
+
+verify_backup_content() {
+    log_step "验证备份内容..."
+    local backup_dir="${BACKUP_ROOT}/${HOSTNAME}/${DATE_ONLY}"
+    [[ ! -d "${backup_dir}" ]] && { log_warning "备份目录不存在"; return 0; }
+
+    local total_files=0 valid_files=0 invalid_files=0
+
+    echo -e "${CYAN}=== 备份内容验证 ===${NC}"
+
+    find "${backup_dir}" -type f -name "*.tar.*" -o -name "*.sql.*" -o -name "*.rdb.*" | while read -r file; do
+        ((total_files++)) || true
+        local ext="${file##*.}"
+
+        case "${ext}" in
+            gz)
+                if gzip -t "${file}" 2>/dev/null; then
+                    echo -e "  ${GREEN}[VALID]${NC} ${file}"
+                    ((valid_files++)) || true
+                else
+                    echo -e "  ${RED}[INVALID]${NC} ${file}"
+                    ((invalid_files++)) || true
+                fi
+                ;;
+            xz)
+                if xz -t "${file}" 2>/dev/null; then
+                    echo -e "  ${GREEN}[VALID]${NC} ${file}"
+                    ((valid_files++)) || true
+                else
+                    echo -e "  ${RED}[INVALID]${NC} ${file}"
+                    ((invalid_files++)) || true
+                fi
+                ;;
+            bz2)
+                if bzip2 -t "${file}" 2>/dev/null; then
+                    echo -e "  ${GREEN}[VALID]${NC} ${file}"
+                    ((valid_files++)) || true
+                else
+                    echo -e "  ${RED}[INVALID]${NC} ${file}"
+                    ((invalid_files++)) || true
+                fi
+                ;;
+            zst)
+                if zstd -t "${file}" 2>/dev/null; then
+                    echo -e "  ${GREEN}[VALID]${NC} ${file}"
+                    ((valid_files++)) || true
+                else
+                    echo -e "  ${RED}[INVALID]${NC} ${file}"
+                    ((invalid_files++)) || true
+                fi
+                ;;
+            *)
+                if [[ -f "${file}.sha256" ]]; then
+                    if sha256sum -c "${file}.sha256" &>/dev/null; then
+                        echo -e "  ${GREEN}[VALID]${NC} ${file}"
+                        ((valid_files++)) || true
+                    else
+                        echo -e "  ${RED}[INVALID]${NC} ${file}"
+                        ((invalid_files++)) || true
+                    fi
+                else
+                    echo -e "  ${YELLOW}[SKIP]${NC} ${file} (无校验文件)"
+                fi
+                ;;
+        esac
+    done
+
+    echo ""
+    log_info "验证结果: 总计 ${total_files}, 有效 ${valid_files}, 无效 ${invalid_files}"
+    [[ ${invalid_files} -eq 0 ]] && log_success "所有备份文件验证通过" || log_error "发现 ${invalid_files} 个无效备份文件"
+}
+
+# ============================================================================
+# 备份加密增强模块
+# ============================================================================
+
+encrypt_backup_directory() {
+    log_step "加密备份目录..."
+    local backup_dir="${BACKUP_ROOT}/${HOSTNAME}/${DATE_ONLY}"
+    [[ ! -d "${backup_dir}" ]] && { log_warning "备份目录不存在"; return 0; }
+    [[ -z "${ENCRYPT_PASS}" ]] && { log_error "未设置加密密码"; return 1; }
+
+    log_info "加密整个备份目录..."
+    local output="${backup_dir}.enc"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        tar -cf - -C "$(dirname "${backup_dir}")" "$(basename "${backup_dir}")" | \
+            openssl enc -aes-256-cbc -salt -pbkdf2 -pass "pass:${ENCRYPT_PASS}" -out "${output}" 2>>"${LOG_FILE}"
+
+        if [[ -f "${output}" ]]; then
+            log_success "目录加密完成: ${output}"
+            generate_checksum "${output}"
+        else
+            log_error "目录加密失败"
+        fi
+    }
+}
+
+decrypt_backup_directory() {
+    local enc_file="$1" output_dir="${2:-.}"
+    [[ ! -f "${enc_file}" ]] && { log_error "加密文件不存在: ${enc_file}"; return 1; }
+    [[ -z "${ENCRYPT_PASS}" ]] && { log_error "未设置加密密码"; return 1; }
+
+    log_info "解密备份目录: ${enc_file}"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        openssl enc -aes-256-cbc -d -pbkdf2 -pass "pass:${ENCRYPT_PASS}" -in "${enc_file}" | \
+            tar -xf - -C "${output_dir}" 2>>"${LOG_FILE}"
+        log_success "目录解密完成"
+    }
+}
+
+# ============================================================================
+# 远程备份增强模块
+# ============================================================================
+
+remote_backup_rclone() {
+    local local_path="$1"
+    command -v rclone &>/dev/null || { log_error "rclone未安装"; return 1; }
+    [[ -z "${REMOTE_PATH}" ]] && { log_error "未配置远程路径"; return 1; }
+
+    log_info "Rclone传输到: ${REMOTE_PATH}"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        rclone sync "${local_path}" "${REMOTE_PATH}" \
+            --progress \
+            --transfers 4 \
+            --checkers 8 \
+            --contimeout 60s \
+            --timeout 300s \
+            --retries 3 \
+            --low-level-retries 10 \
+            2>>"${LOG_FILE}"
+    }
+}
+
+remote_backup_oss() {
+    local local_path="$1"
+    command -v ossutil &>/dev/null || { log_error "ossutil未安装"; return 1; }
+    [[ -z "${S3_BUCKET}" ]] && { log_error "未配置OSS Bucket"; return 1; }
+
+    log_info "OSS上传: ${S3_BUCKET}"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        ossutil cp -r -f "${local_path}" "oss://${S3_BUCKET}/${REMOTE_PATH}/" 2>>"${LOG_FILE}"
+    }
+}
+
+remote_backup_cos() {
+    local local_path="$1"
+    command -v coscli &>/dev/null || { log_error "coscli未安装"; return 1; }
+    [[ -z "${S3_BUCKET}" ]] && { log_error "未配置COS Bucket"; return 1; }
+
+    log_info "COS上传: ${S3_BUCKET}"
+    [[ ${DRY_RUN} -eq 0 ]] && {
+        coscli cp -r "${local_path}" "cos://${S3_BUCKET}/${REMOTE_PATH}/" 2>>"${LOG_FILE}"
+    }
+}
+
+# ============================================================================
+# 备份监控与告警模块
+# ============================================================================
+
+check_backup_health() {
+    log_step "检查备份健康状态..."
+    local healthy=1
+
+    echo -e "${CYAN}=== 备份健康检查 ===${NC}"
+
+    echo -e "\n${WHITE}[最近备份时间]${NC}"
+    local last_backup
+    last_backup="$(ls -dt "${BACKUP_ROOT}/${HOSTNAME}"/20* 2>/dev/null | head -1)"
+    if [[ -n "${last_backup}" ]]; then
+        local last_date="$(basename "${last_backup}")"
+        local days_ago=$(( ($(date +%s) - $(date -d "${last_date}" +%s 2>/dev/null || echo 0)) / 86400 ))
+        if [[ ${days_ago} -gt 1 ]]; then
+            echo -e "  ${RED}[WARN]${NC} 最近备份在 ${days_ago} 天前"
+            healthy=0
+        else
+            echo -e "  ${GREEN}[OK]${NC} 最近备份在 ${days_ago} 天前"
+        fi
+    else
+        echo -e "  ${RED}[ERROR]${NC} 没有找到任何备份"
+        healthy=0
+    fi
+
+    echo -e "\n${WHITE}[备份大小趋势]${NC}"
+    local prev_size=0
+    ls -dt "${BACKUP_ROOT}/${HOSTNAME}"/20* 2>/dev/null | head -7 | while read -r dir; do
+        local name="$(basename "${dir}")"
+        local size="$(du -sh "${dir}" 2>/dev/null | cut -f1)"
+        echo "  ${name}: ${size}"
+    done
+
+    echo -e "\n${WHITE}[磁盘空间]${NC}"
+    local usage_pct
+    usage_pct="$(df -h "${BACKUP_ROOT}" 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')"
+    if [[ -n "${usage_pct}" ]] && [[ ${usage_pct} -gt 90 ]]; then
+        echo -e "  ${RED}[CRITICAL]${NC} 磁盘使用率: ${usage_pct}%"
+        healthy=0
+    elif [[ -n "${usage_pct}" ]] && [[ ${usage_pct} -gt 80 ]]; then
+        echo -e "  ${YELLOW}[WARNING]${NC} 磁盘使用率: ${usage_pct}%"
+    else
+        echo -e "  ${GREEN}[OK]${NC} 磁盘使用率: ${usage_pct:-0}%"
+    fi
+
+    echo -e "\n${WHITE}[校验文件完整性]${NC}"
+    local failed_checks=0
+    find "${BACKUP_ROOT}" -name "*.sha256" -mtime -7 | while read -r sha_file; do
+        if ! sha256sum -c "${sha_file}" &>/dev/null; then
+            echo -e "  ${RED}[FAIL]${NC} ${sha_file%.sha256}"
+            failed_checks=$((failed_checks + 1))
+        fi
+    done
+    [[ ${failed_checks} -eq 0 ]] && echo -e "  ${GREEN}[OK]${NC} 所有校验文件通过"
+
+    [[ ${healthy} -eq 1 ]] && log_success "备份健康检查通过" || log_warning "备份健康检查发现问题"
+    return ${healthy}
+}
+
+# ============================================================================
+# 备份恢复增强模块
+# ============================================================================
+
+restore_mysql_database() {
+    local backup_file="$1" target_db="$2"
+    [[ ! -f "${backup_file}" ]] && { log_error "备份文件不存在: ${backup_file}"; return 1; }
+    command -v mysql &>/dev/null || { log_error "mysql未安装"; return 1; }
+
+    local mysql_host="${DB_CONFIG[mysql_host]:-localhost}"
+    local mysql_port="${DB_CONFIG[mysql_port]:-3306}"
+    local mysql_user="${DB_CONFIG[mysql_user]:-root}"
+    local mysql_pass="${DB_CONFIG[mysql_pass]:-}"
+
+    local auth_opts=""
+    [[ -n "${mysql_pass}" ]] && auth_opts="-u${mysql_user} -p${mysql_pass} -h${mysql_host} -P${mysql_port}"
+
+    log_info "恢复MySQL数据库: ${target_db}"
+
+    if [[ "${backup_file}" == *.gz ]]; then
+        gunzip -c "${backup_file}" | mysql ${auth_opts} "${target_db}" 2>>"${LOG_FILE}"
+    elif [[ "${backup_file}" == *.xz ]]; then
+        xz -dc "${backup_file}" | mysql ${auth_opts} "${target_db}" 2>>"${LOG_FILE}"
+    else
+        mysql ${auth_opts} "${target_db}" < "${backup_file}" 2>>"${LOG_FILE}"
+    fi
+
+    [[ $? -eq 0 ]] && log_success "MySQL数据库恢复完成: ${target_db}" || log_error "MySQL数据库恢复失败: ${target_db}"
+}
+
+restore_postgresql_database() {
+    local backup_file="$1" target_db="$2"
+    [[ ! -f "${backup_file}" ]] && { log_error "备份文件不存在: ${backup_file}"; return 1; }
+    command -v pg_restore &>/dev/null || { log_error "pg_restore未安装"; return 1; }
+
+    local pg_host="${DB_CONFIG[pg_host]:-localhost}"
+    local pg_port="${DB_CONFIG[pg_port]:-5432}"
+    local pg_user="${DB_CONFIG[pg_user]:-postgres}"
+    local pg_pass="${DB_CONFIG[pg_pass]:-}"
+
+    local conn_opts="-h${pg_host} -p${pg_port} -U${pg_user}"
+
+    log_info "恢复PostgreSQL数据库: ${target_db}"
+    PGPASSWORD="${pg_pass}" pg_restore ${conn_opts} -d "${target_db}" -c "${backup_file}" 2>>"${LOG_FILE}"
+
+    [[ $? -eq 0 ]] && log_success "PostgreSQL数据库恢复完成: ${target_db}" || log_error "PostgreSQL数据库恢复失败: ${target_db}"
+}
+
+# ============================================================================
+# 备份调度安装模块
+# ============================================================================
+
+install_cron_schedule() {
+    log_step "安装备份定时任务..."
+    local script_path="$(realpath "$0" 2>/dev/null || echo "$0")"
+    local config_arg=""
+    [[ -n "${CONFIG_FILE}" ]] && config_arg="--config-file ${CONFIG_FILE}"
+
+    local cron_entry_full="0 2 * * 0 ${script_path} --all ${config_arg} >> /var/log/auto_backup/cron.log 2>&1"
+    local cron_entry_incr="0 2 * * 1-6 ${script_path} --incremental ${config_arg} >> /var/log/auto_backup/cron.log 2>&1"
+    local cron_entry_db="0 3 * * * ${script_path} --database ${config_arg} >> /var/log/auto_backup/cron.log 2>&1"
+    local cron_entry_cleanup="0 5 * * 1 ${script_path} --cleanup ${config_arg} >> /var/log/auto_backup/cron.log 2>&1"
+
+    echo -e "${CYAN}=== 建议的Cron配置 ===${NC}"
+    echo "  # 全量备份 (每周日 02:00)"
+    echo "  ${cron_entry_full}"
+    echo "  # 增量备份 (周一至周六 02:00)"
+    echo "  ${cron_entry_incr}"
+    echo "  # 数据库备份 (每日 03:00)"
+    echo "  ${cron_entry_db}"
+    echo "  # 清理过期备份 (每周一 05:00)"
+    echo "  ${cron_entry_cleanup}"
+
+    if [[ ${INTERACTIVE} -eq 1 ]] && [[ ${DRY_RUN} -eq 0 ]]; then
+        confirm_action "是否自动安装以上Cron任务?" && {
+            (crontab -l 2>/dev/null | grep -v "auto_backup.sh"; echo "${cron_entry_full}"; echo "${cron_entry_incr}"; echo "${cron_entry_db}"; echo "${cron_entry_cleanup}") | crontab -
+            log_success "Cron任务已安装"
+        }
+    fi
+}
+
+# ============================================================================
+# 备份统计模块
+# ============================================================================
+
+show_backup_statistics() {
+    log_step "备份统计信息..."
+    echo -e "${CYAN}=== 备份统计 ===${NC}"
+
+    echo -e "\n${WHITE}[备份概览]${NC}"
+    local total_backups=0 total_size=0
+    if [[ -d "${BACKUP_ROOT}/${HOSTNAME}" ]]; then
+        for dir in "${BACKUP_ROOT}/${HOSTNAME}"/20*; do
+            [[ -d "${dir}" ]] || continue
+            ((total_backups++)) || true
+            local dir_size="$(du -sb "${dir}" 2>/dev/null | cut -f1)"
+            total_size=$((total_size + dir_size))
+        done
+    fi
+    echo "  备份总数: ${total_backups}"
+    echo "  总大小: $(human_size ${total_size})"
+
+    echo -e "\n${WHITE}[最近7天备份]${NC}"
+    ls -dt "${BACKUP_ROOT}/${HOSTNAME}"/20* 2>/dev/null | head -7 | while read -r dir; do
+        local name="$(basename "${dir}")"
+        local size="$(du -sh "${dir}" 2>/dev/null | cut -f1)"
+        local file_count="$(find "${dir}" -type f | wc -l)"
+        echo "  ${name}: ${size} (${file_count} 文件)"
+    done
+
+    echo -e "\n${WHITE}[数据库备份统计]${NC}"
+    find "${BACKUP_ROOT}/${HOSTNAME}" -name "mysql_*" -o -name "postgresql_*" -o -name "mongodb_*" -o -name "redis_*" 2>/dev/null | \
+        awk -F/ '{print $(NF-1)"/"$NF}' | sort | tail -10 | while read -r f; do
+        echo "  ${f}"
+    done
+
+    echo -e "\n${WHITE}[磁盘使用趋势]${NC}"
+    df -h "${BACKUP_ROOT}" 2>/dev/null | awk 'NR==2{printf "  总计: %s | 已用: %s | 可用: %s | 使用率: %s\n", $2, $3, $4, $5}'
+
+    log_success "备份统计完成"
+}
+
+# ============================================================================
+# 备份清单导出模块
+# ============================================================================
+
+export_backup_manifest() {
+    log_step "导出备份清单..."
+    local backup_dir="${BACKUP_ROOT}/${HOSTNAME}/${DATE_ONLY}"
+    local manifest_file="${backup_dir}/MANIFEST.json"
+    [[ ! -d "${backup_dir}" ]] && { log_warning "备份目录不存在"; return 0; }
+
+    log_info "生成JSON格式备份清单..."
+    cat > "${manifest_file}" << MANIFEST_HEAD
+{
+  "hostname": "${HOSTNAME}",
+  "timestamp": "${TIMESTAMP}",
+  "date": "${DATE_ONLY}",
+  "backup_root": "${BACKUP_ROOT}",
+  "compress_format": "${COMPRESS_FORMAT}",
+  "encrypted": $([[ ${ENCRYPT_BACKUP} -eq 1 ]] && echo "true" || echo "false"),
+  "retention_days": ${RETENTION_DAYS},
+  "retention_weeks": ${RETENTION_WEEKS},
+  "retention_months": ${RETENTION_MONTHS},
+  "files": [
+MANIFEST_HEAD
+
+    local first=1
+    find "${backup_dir}" -type f ! -name "MANIFEST.json" ! -name "*.sha256" ! -name "*.md5" | sort | while read -r file; do
+        local rel_path="${file#${backup_dir}/}"
+        local fsize="$(stat -c%s "${file}" 2>/dev/null || echo 0)"
+        local fmod="$(stat -c%Y "${file}" 2>/dev/null || echo 0)"
+        local ftype="${file##*.}"
+        local checksum=""
+        [[ -f "${file}.sha256" ]] && checksum="$(awk '{print $1}' "${file}.sha256" 2>/dev/null)"
+        [[ ${first} -eq 0 ]] && echo "," >> "${manifest_file}"
+        first=0
+        cat >> "${manifest_file}" << FILE_ENTRY
+    {
+      "path": "${rel_path}",
+      "size": ${fsize},
+      "modified": ${fmod},
+      "type": "${ftype}",
+      "sha256": "${checksum}"
+    }
+FILE_ENTRY
+    done
+
+    echo "" >> "${manifest_file}"
+    echo "  ]," >> "${manifest_file}"
+
+    local total_size="$(du -sb "${backup_dir}" 2>/dev/null | cut -f1)"
+    local total_files="$(find "${backup_dir}" -type f ! -name "MANIFEST.json" | wc -l)"
+    cat >> "${manifest_file}" << MANIFEST_FOOT
+  "total_size": ${total_size:-0},
+  "total_files": ${total_files:-0},
+  "stats": {
+    "success_count": ${BACKUP_STATS[success_count]},
+    "error_count": ${BACKUP_STATS[error_count]},
+    "total_size": ${BACKUP_STATS[total_size]}
+  }
+}
+MANIFEST_FOOT
+
+    log_success "备份清单已导出: ${manifest_file}"
+}
+
 show_usage() {
     cat << USAGE
 自动备份脚本 v${SCRIPT_VERSION}
@@ -961,7 +1894,18 @@ show_usage() {
   --restore FILE     从备份文件恢复
   --list             列出所有备份
   --verify           校验备份完整性
+  --verify-content   验证备份压缩文件内容
   --cleanup          清理过期备份
+  --health-check     检查备份健康状态
+  --plan             生成备份计划
+  --report           生成HTML备份报告
+  --statistics       显示备份统计
+  --install-cron     安装备份定时任务
+  --pre-check        执行备份前检查
+  --dedup            备份去重
+  --optimize         优化备份压缩
+  --encrypt-dir      加密整个备份目录
+  --decrypt-dir FILE 解密备份目录
 
 控制选项:
   --dry-run          模拟运行
@@ -975,7 +1919,7 @@ show_usage() {
   compress_format=xz
   encrypt_backup=1
   encrypt_pass=YourPassword
-  remote_type=rsync|scp|s3
+  remote_type=rsync|scp|s3|rclone|oss|cos
   remote_host=192.168.1.100
   remote_user=backup
   remote_path=/backup
@@ -997,24 +1941,34 @@ parse_args() {
     [[ $# -eq 0 ]] && { show_usage; exit 0; }
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --all)         SELECTED_MODULES[all]=1 ;;
-            --files)       SELECTED_MODULES[files]=1 ;;
-            --incremental) SELECTED_MODULES[incremental]=1 ;;
-            --database)    SELECTED_MODULES[database]=1 ;;
-            --config)      SELECTED_MODULES[config]=1 ;;
-            --docker)      SELECTED_MODULES[docker]=1 ;;
-            --restore)     SELECTED_MODULES[restore]=1; RESTORE_FILE="$2"; shift ;;
-            --list)        SELECTED_MODULES[list]=1 ;;
-            --verify)      SELECTED_MODULES[verify]=1 ;;
-            --cleanup)     SELECTED_MODULES[cleanup]=1 ;;
-            --dry-run)     DRY_RUN=1 ;;
-            --verbose)     VERBOSE=1 ;;
-            --config-file) CONFIG_FILE="$2"; shift ;;
+            --all)         SELECTED_MODULES[all]=1; shift ;;
+            --files)       SELECTED_MODULES[files]=1; shift ;;
+            --incremental) SELECTED_MODULES[incremental]=1; shift ;;
+            --database)    SELECTED_MODULES[database]=1; shift ;;
+            --config)      SELECTED_MODULES[config]=1; shift ;;
+            --docker)      SELECTED_MODULES[docker]=1; shift ;;
+            --restore)     SELECTED_MODULES[restore]=1; RESTORE_FILE="$2"; shift 2 ;;
+            --list)        SELECTED_MODULES[list]=1; shift ;;
+            --verify)      SELECTED_MODULES[verify]=1; shift ;;
+            --verify-content) SELECTED_MODULES[verify_content]=1; shift ;;
+            --cleanup)     SELECTED_MODULES[cleanup]=1; shift ;;
+            --health-check) SELECTED_MODULES[health_check]=1; shift ;;
+            --plan)        SELECTED_MODULES[plan]=1; shift ;;
+            --report)      SELECTED_MODULES[report]=1; shift ;;
+            --statistics)  SELECTED_MODULES[statistics]=1; shift ;;
+            --install-cron) SELECTED_MODULES[install_cron]=1; shift ;;
+            --pre-check)   SELECTED_MODULES[pre_check]=1; shift ;;
+            --dedup)       SELECTED_MODULES[dedup]=1; shift ;;
+            --optimize)    SELECTED_MODULES[optimize]=1; shift ;;
+            --encrypt-dir) SELECTED_MODULES[encrypt_dir]=1; shift ;;
+            --decrypt-dir) SELECTED_MODULES[decrypt_dir]=1; DECRYPT_FILE="$2"; shift 2 ;;
+            --dry-run)     DRY_RUN=1; shift ;;
+            --verbose)     VERBOSE=1; shift ;;
+            --config-file) CONFIG_FILE="$2"; shift 2 ;;
             --help|-h)     show_usage; exit 0 ;;
             --version|-v)  echo "v${SCRIPT_VERSION}"; exit 0 ;;
             *)             log_error "未知选项: $1"; show_usage; exit 1 ;;
         esac
-        shift
     done
 }
 
@@ -1029,15 +1983,25 @@ main() {
 
     [[ -n "${CONFIG_FILE}" ]] && parse_config_file "${CONFIG_FILE}"
 
-    [[ -n "${SELECTED_MODULES[restore]:-}" ]] && { restore_backup "${RESTORE_FILE}"; exit $?; }
-    [[ -n "${SELECTED_MODULES[list]:-}" ]]    && { list_backups; exit 0; }
-    [[ -n "${SELECTED_MODULES[verify]:-}" ]]  && { verify_all_backups; exit 0; }
-    [[ -n "${SELECTED_MODULES[cleanup]:-}" ]] && { check_root; cleanup_backups; exit 0; }
+    [[ -n "${SELECTED_MODULES[restore]:-}" ]]       && { restore_backup "${RESTORE_FILE}"; exit $?; }
+    [[ -n "${SELECTED_MODULES[list]:-}" ]]           && { list_backups; exit 0; }
+    [[ -n "${SELECTED_MODULES[verify]:-}" ]]         && { verify_all_backups; exit 0; }
+    [[ -n "${SELECTED_MODULES[verify_content]:-}" ]] && { verify_backup_content; exit 0; }
+    [[ -n "${SELECTED_MODULES[cleanup]:-}" ]]        && { check_root; cleanup_backups; exit 0; }
+    [[ -n "${SELECTED_MODULES[health_check]:-}" ]]   && { check_backup_health; exit $?; }
+    [[ -n "${SELECTED_MODULES[plan]:-}" ]]           && { generate_backup_plan; exit 0; }
+    [[ -n "${SELECTED_MODULES[statistics]:-}" ]]     && { show_backup_statistics; exit 0; }
+    [[ -n "${SELECTED_MODULES[install_cron]:-}" ]]   && { install_cron_schedule; exit 0; }
+    [[ -n "${SELECTED_MODULES[pre_check]:-}" ]]      && { pre_backup_check; exit $?; }
+    [[ -n "${SELECTED_MODULES[encrypt_dir]:-}" ]]    && { check_root; encrypt_backup_directory; exit 0; }
+    [[ -n "${SELECTED_MODULES[decrypt_dir]:-}" ]]    && { decrypt_backup_directory "${DECRYPT_FILE}"; exit $?; }
 
     check_root; acquire_lock; trap release_lock EXIT
     mkdir -p "${BACKUP_ROOT}" "${LOG_DIR}" 2>/dev/null || true
 
     [[ ${DRY_RUN} -eq 1 ]] && log_warning "====== 模拟运行模式 ======"
+
+    [[ -n "${SELECTED_MODULES[pre_check]:-}" ]] || pre_backup_check
 
     if [[ -n "${SELECTED_MODULES[all]:-}" ]]; then
         backup_files; backup_databases; backup_configs; backup_docker
@@ -1049,8 +2013,13 @@ main() {
         [[ -n "${SELECTED_MODULES[docker]:-}" ]]       && backup_docker
     fi
 
+    [[ -n "${SELECTED_MODULES[dedup]:-}" ]]           && deduplicate_backups
+    [[ -n "${SELECTED_MODULES[optimize]:-}" ]]        && optimize_backup_compression
+
     [[ -n "${REMOTE_TYPE}" ]] && transfer_backup
     cleanup_backups
+
+    [[ -n "${SELECTED_MODULES[report]:-}" ]]          && generate_backup_report
 
     BACKUP_STATS[end_time]="$(date +%s)"
     local duration=$((BACKUP_STATS[end_time] - BACKUP_STATS[start_time]))
