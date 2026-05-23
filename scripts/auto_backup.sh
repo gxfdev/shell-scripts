@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  自动备份脚本 (Auto Backup Script)
-#  支持: CentOS/RHEL, Ubuntu/Debian, Alpine, Arch Linux, openSUSE
-#  版本: 2.0.0
+#  支持: Linux (CentOS/Ubuntu/Debian/Alpine/Arch/openSUSE), macOS, Windows WSL/Git Bash
+#  版本: 2.1.0
 #  作者: gxfdev
 #  仓库: https://github.com/gxfdev/shell-scripts
 # ============================================================================
@@ -33,9 +33,18 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="auto_backup"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "${SCRIPT_DIR}")/lib"
+
+if [[ -f "${LIB_DIR}/common_lib.sh" ]]; then
+    source "${LIB_DIR}/common_lib.sh"
+    common_init
+else
+    echo "[WARN] common_lib.sh not found in ${LIB_DIR}, using fallback" >&2
+fi
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 DATE_ONLY="$(date +%Y%m%d)"
 HOSTNAME="$(hostname -s 2>/dev/null || echo 'unknown')"
@@ -124,6 +133,13 @@ BANNER
 }
 
 detect_os() {
+    if [[ -n "${COMMON_OS_DISTRO:-}" ]]; then
+        OS_INFO[id]="${COMMON_OS_DISTRO}"
+        OS_INFO[family]="${COMMON_OS_FAMILY}"
+        OS_INFO[pkg_manager]="${COMMON_PKG_MANAGER}"
+        return 0
+    fi
+
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
         OS_INFO[id]="${ID:-unknown}"; OS_INFO[family]=""

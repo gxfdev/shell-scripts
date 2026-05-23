@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  系统初始化自动化脚本 (System Initialization Script)
-#  支持: CentOS/RHEL 7/8/9, Ubuntu/Debian, Alpine, Arch Linux, openSUSE
-#  版本: 2.0.0
+#  支持: Linux (CentOS/Ubuntu/Debian/Alpine/Arch/openSUSE), macOS, Windows WSL/Git Bash
+#  版本: 2.1.0
 #  作者: gxfdev
 #  仓库: https://github.com/gxfdev/shell-scripts
 # ============================================================================
@@ -25,9 +25,18 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="system_init"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "${SCRIPT_DIR}")/lib"
+
+if [[ -f "${LIB_DIR}/common_lib.sh" ]]; then
+    source "${LIB_DIR}/common_lib.sh"
+    common_init
+else
+    echo "[WARN] common_lib.sh not found in ${LIB_DIR}, using fallback" >&2
+fi
+
 LOG_DIR="/var/log/system_init"
 BACKUP_DIR="/var/backups/system_init"
 CONFIG_FILE=""
@@ -44,9 +53,11 @@ declare -A SELECTED_MODULES
 declare -A OS_INFO
 declare -A CONFIG_VALUES
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
-WHITE='\033[1;37m'; NC='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
+if [[ -z "${RED:-}" ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
+    WHITE='\033[1;37m'; NC='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
+fi
 
 print_banner() {
     echo -e "${CYAN}"
@@ -150,61 +161,116 @@ release_lock() { rm -f "${LOCK_FILE}"; }
 
 detect_os() {
     log_step "检测操作系统..."
-    OS_INFO[hostname]="$(hostname 2>/dev/null || echo 'unknown')"
-    OS_INFO[kernel]="$(uname -r 2>/dev/null || echo 'unknown')"
-    OS_INFO[arch]="$(uname -m 2>/dev/null || echo 'unknown')"
-    OS_INFO[cpu_cores]="$(nproc 2>/dev/null || echo 1)"
-    OS_INFO[cpu_model]="$(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs 2>/dev/null || echo 'unknown')"
-    OS_INFO[mem_total]="$(free -g | awk '/^Mem:/{print $2}')"
-    OS_INFO[disk_total]="$(df -hG / | awk 'NR==2{print $2}')"
 
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        OS_INFO[id]="${ID:-unknown}"; OS_INFO[id_like]="${ID_LIKE:-}"
-        OS_INFO[name]="${NAME:-unknown}"; OS_INFO[version]="${VERSION:-unknown}"
-        OS_INFO[version_id]="${VERSION_ID:-unknown}"; OS_INFO[pretty_name]="${PRETTY_NAME:-unknown}"
-    elif [[ -f /etc/redhat-release ]]; then
-        OS_INFO[id]="rhel"; OS_INFO[name]="$(cat /etc/redhat-release)"
-        OS_INFO[version_id]="$(cat /etc/redhat-release | grep -oP '\d+' | head -1)"
-    elif [[ -f /etc/alpine-release ]]; then
-        OS_INFO[id]="alpine"; OS_INFO[name]="Alpine Linux"; OS_INFO[version_id]="$(cat /etc/alpine-release)"
-    else
-        OS_INFO[id]="unknown"; OS_INFO[name]="Unknown Linux"
+    if command -v detect_os &>/dev/null && type detect_os | grep -q function; then
+        :
     fi
 
-    case "${OS_INFO[id]}" in
-        centos|rhel|rocky|almalinux|ol|fedora)
-            OS_INFO[family]="rhel"; OS_INFO[pkg_manager]="yum"
-            [[ "${OS_INFO[id]}" == "fedora" || "${OS_INFO[version_id]%%.*}" -ge 8 ]] 2>/dev/null && OS_INFO[pkg_manager]="dnf"
-            OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="firewalld"; OS_INFO[config_dir]="/etc/sysconfig" ;;
-        ubuntu|debian|linuxmint|pop|elementary)
-            OS_INFO[family]="debian"; OS_INFO[pkg_manager]="apt"
-            OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="ufw"; OS_INFO[config_dir]="/etc/default" ;;
-        alpine)
-            OS_INFO[family]="alpine"; OS_INFO[pkg_manager]="apk"
-            OS_INFO[service_manager]="openrc"; OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc/conf.d" ;;
-        arch|manjaro|endeavouros|garuda)
-            OS_INFO[family]="arch"; OS_INFO[pkg_manager]="pacman"
-            OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc" ;;
-        opensuse*|sles|sled)
-            OS_INFO[family]="suse"; OS_INFO[pkg_manager]="zypper"
-            OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="firewalld"; OS_INFO[config_dir]="/etc/sysconfig" ;;
-        *)
-            OS_INFO[family]="unknown"; OS_INFO[pkg_manager]="unknown"
-            OS_INFO[service_manager]="unknown"; OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc" ;;
-    esac
+    if [[ -n "${COMMON_OS_DISTRO:-}" ]]; then
+        OS_INFO[id]="${COMMON_OS_DISTRO}"
+        OS_INFO[family]="${COMMON_OS_FAMILY}"
+        OS_INFO[pkg_manager]="${COMMON_PKG_MANAGER}"
+        OS_INFO[service_manager]="${COMMON_SVC_MANAGER}"
+        OS_INFO[version_id]="${COMMON_OS_VERSION}"
+        OS_INFO[arch]="${COMMON_OS_ARCH}"
+        OS_INFO[kernel]="${COMMON_OS_KERNEL}"
+        OS_INFO[hostname]="${COMMON_HOSTNAME}"
+        OS_INFO[name]="${COMMON_OS_DISTRO^}"
+        OS_INFO[pretty_name]="${COMMON_OS_DISTRO} ${COMMON_OS_VERSION}"
+        OS_INFO[id_like]=""
 
-    OS_INFO[is_container]=0
-    [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|containerd)' /proc/1/cgroup 2>/dev/null && OS_INFO[is_container]=1
-    OS_INFO[virtual]="physical"
-    command -v systemd-detect-virt &>/dev/null && OS_INFO[virtual]="$(systemd-detect-virt 2>/dev/null || echo 'physical')"
+        case "${COMMON_OS_FAMILY}" in
+            rhel)   OS_INFO[firewall]="firewalld"; OS_INFO[config_dir]="/etc/sysconfig" ;;
+            debian) OS_INFO[firewall]="ufw"; OS_INFO[config_dir]="/etc/default" ;;
+            alpine) OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc/conf.d" ;;
+            arch)   OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc" ;;
+            suse)   OS_INFO[firewall]="firewalld"; OS_INFO[config_dir]="/etc/sysconfig" ;;
+            darwin) OS_INFO[firewall]="pf"; OS_INFO[config_dir]="/etc" ;;
+            windows) OS_INFO[firewall]="netsh"; OS_INFO[config_dir]="/etc" ;;
+            *)      OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc" ;;
+        esac
+
+        if [[ ${COMMON_IS_MACOS:-0} -eq 1 ]]; then
+            OS_INFO[cpu_cores]="$(sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+            OS_INFO[cpu_model]="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')"
+            OS_INFO[mem_total]="$(echo "$(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824" | bc 2>/dev/null || echo 'unknown')"
+            OS_INFO[disk_total]="$(df -h / 2>/dev/null | awk 'NR==2{print $2}')"
+        elif [[ ${COMMON_IS_WSL:-0} -eq 1 || ${COMMON_IS_WINDOWS:-0} -eq 1 ]]; then
+            OS_INFO[cpu_cores]="$(nproc 2>/dev/null || echo 1)"
+            OS_INFO[cpu_model]="$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d':' -f2 | xargs || echo 'unknown')"
+            OS_INFO[mem_total]="$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || echo 'unknown')"
+            OS_INFO[disk_total]="$(df -hG / 2>/dev/null | awk 'NR==2{print $2}' || echo 'unknown')"
+        else
+            OS_INFO[cpu_cores]="$(nproc 2>/dev/null || echo 1)"
+            OS_INFO[cpu_model]="$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d':' -f2 | xargs || echo 'unknown')"
+            OS_INFO[mem_total]="$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || echo 'unknown')"
+            OS_INFO[disk_total]="$(df -hG / 2>/dev/null | awk 'NR==2{print $2}' || echo 'unknown')"
+        fi
+
+        OS_INFO[is_container]="${COMMON_IS_CONTAINER:-0}"
+        OS_INFO[virtual]="physical"
+        if [[ ${COMMON_IS_VM:-0} -eq 1 ]]; then
+            command -v systemd-detect-virt &>/dev/null && OS_INFO[virtual]="$(systemd-detect-virt 2>/dev/null || echo 'vm')"
+        fi
+    else
+        OS_INFO[hostname]="$(hostname 2>/dev/null || echo 'unknown')"
+        OS_INFO[kernel]="$(uname -r 2>/dev/null || echo 'unknown')"
+        OS_INFO[arch]="$(uname -m 2>/dev/null || echo 'unknown')"
+        OS_INFO[cpu_cores]="$(nproc 2>/dev/null || echo 1)"
+        OS_INFO[cpu_model]="$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d':' -f2 | xargs || echo 'unknown')"
+        OS_INFO[mem_total]="$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || echo 'unknown')"
+        OS_INFO[disk_total]="$(df -hG / 2>/dev/null | awk 'NR==2{print $2}' || echo 'unknown')"
+
+        if [[ -f /etc/os-release ]]; then
+            source /etc/os-release
+            OS_INFO[id]="${ID:-unknown}"; OS_INFO[id_like]="${ID_LIKE:-}"
+            OS_INFO[name]="${NAME:-unknown}"; OS_INFO[version]="${VERSION:-unknown}"
+            OS_INFO[version_id]="${VERSION_ID:-unknown}"; OS_INFO[pretty_name]="${PRETTY_NAME:-unknown}"
+        elif [[ -f /etc/redhat-release ]]; then
+            OS_INFO[id]="rhel"; OS_INFO[name]="$(cat /etc/redhat-release)"
+            OS_INFO[version_id]="$(cat /etc/redhat-release | grep -oP '\d+' | head -1)"
+        elif [[ -f /etc/alpine-release ]]; then
+            OS_INFO[id]="alpine"; OS_INFO[name]="Alpine Linux"; OS_INFO[version_id]="$(cat /etc/alpine-release)"
+        else
+            OS_INFO[id]="unknown"; OS_INFO[name]="Unknown Linux"
+        fi
+
+        case "${OS_INFO[id]}" in
+            centos|rhel|rocky|almalinux|ol|fedora)
+                OS_INFO[family]="rhel"; OS_INFO[pkg_manager]="yum"
+                [[ "${OS_INFO[id]}" == "fedora" || "${OS_INFO[version_id]%%.*}" -ge 8 ]] 2>/dev/null && OS_INFO[pkg_manager]="dnf"
+                OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="firewalld"; OS_INFO[config_dir]="/etc/sysconfig" ;;
+            ubuntu|debian|linuxmint|pop|elementary)
+                OS_INFO[family]="debian"; OS_INFO[pkg_manager]="apt"
+                OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="ufw"; OS_INFO[config_dir]="/etc/default" ;;
+            alpine)
+                OS_INFO[family]="alpine"; OS_INFO[pkg_manager]="apk"
+                OS_INFO[service_manager]="openrc"; OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc/conf.d" ;;
+            arch|manjaro|endeavouros|garuda)
+                OS_INFO[family]="arch"; OS_INFO[pkg_manager]="pacman"
+                OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc" ;;
+            opensuse*|sles|sled)
+                OS_INFO[family]="suse"; OS_INFO[pkg_manager]="zypper"
+                OS_INFO[service_manager]="systemd"; OS_INFO[firewall]="firewalld"; OS_INFO[config_dir]="/etc/sysconfig" ;;
+            *)
+                OS_INFO[family]="unknown"; OS_INFO[pkg_manager]="unknown"
+                OS_INFO[service_manager]="unknown"; OS_INFO[firewall]="iptables"; OS_INFO[config_dir]="/etc" ;;
+        esac
+
+        OS_INFO[is_container]=0
+        [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|containerd)' /proc/1/cgroup 2>/dev/null && OS_INFO[is_container]=1
+        OS_INFO[virtual]="physical"
+        command -v systemd-detect-virt &>/dev/null && OS_INFO[virtual]="$(systemd-detect-virt 2>/dev/null || echo 'physical')"
+    fi
 
     log_success "操作系统检测完成:"
-    log_info "  系统: ${OS_INFO[pretty_name]} | 家族: ${OS_INFO[family]}"
+    log_info "  系统: ${OS_INFO[pretty_name]:-unknown} | 家族: ${OS_INFO[family]}"
     log_info "  版本: ${OS_INFO[version_id]} | 内核: ${OS_INFO[kernel]} | 架构: ${OS_INFO[arch]}"
     log_info "  CPU: ${OS_INFO[cpu_model]} (${OS_INFO[cpu_cores]}核) | 内存: ${OS_INFO[mem_total]}GB"
     log_info "  包管理器: ${OS_INFO[pkg_manager]} | 服务管理: ${OS_INFO[service_manager]} | 防火墙: ${OS_INFO[firewall]}"
-    [[ ${OS_INFO[is_container]} -eq 1 ]] && log_warning "  检测到容器环境, 部分功能可能受限"
+    [[ ${OS_INFO[is_container]:-0} -eq 1 ]] && log_warning "  检测到容器环境, 部分功能可能受限"
+    [[ ${COMMON_IS_MACOS:-0} -eq 1 ]] && log_info "  macOS环境: 部分Linux专属功能将跳过"
+    [[ ${COMMON_IS_WSL:-0} -eq 1 ]] && log_info "  WSL环境: 使用systemd或自定义服务管理"
 }
 
 check_root() { [[ ${EUID} -ne 0 ]] && die "此脚本需要root权限运行, 请使用 sudo 或切换到root用户"; }

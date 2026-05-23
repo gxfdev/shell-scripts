@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  服务管理脚本 (Service Manager Script)
-#  支持: CentOS/RHEL, Ubuntu/Debian, Alpine, Arch Linux, openSUSE
-#  版本: 2.0.0
+#  支持: Linux (CentOS/Ubuntu/Debian/Alpine/Arch/openSUSE), macOS, Windows WSL/Git Bash
+#  版本: 2.1.0
 #  作者: gxfdev
 #  仓库: https://github.com/gxfdev/shell-scripts
 # ============================================================================
@@ -21,9 +21,18 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="service_manager"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "${SCRIPT_DIR}")/lib"
+
+if [[ -f "${LIB_DIR}/common_lib.sh" ]]; then
+    source "${LIB_DIR}/common_lib.sh"
+    common_init
+else
+    echo "[WARN] common_lib.sh not found in ${LIB_DIR}, using fallback" >&2
+fi
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="/var/log/service_manager"
 LOG_FILE="${LOG_DIR}/service_manager_${TIMESTAMP}.log"
@@ -45,9 +54,11 @@ declare -A OS_INFO
 declare -A STATS
 STATS[total]=0; STATS[running]=0; STATS[stopped]=0; STATS[failed]=0
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
-WHITE='\033[1;37m'; NC='\033[0m'; DIM='\033[2m'
+if [[ -z "${RED:-}" ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
+    WHITE='\033[1;37m'; NC='\033[0m'; DIM='\033[2m'
+fi
 
 log() {
     local level="$1"; shift; local message="$*"
@@ -83,6 +94,13 @@ BANNER
 }
 
 detect_os() {
+    if [[ -n "${COMMON_OS_DISTRO:-}" ]]; then
+        OS_INFO[id]="${COMMON_OS_DISTRO}"
+        OS_INFO[family]="${COMMON_OS_FAMILY}"
+        OS_INFO[svc_mgr]="${COMMON_SVC_MANAGER}"
+        return 0
+    fi
+
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
         OS_INFO[id]="${ID:-unknown}"
@@ -98,10 +116,16 @@ detect_os() {
 }
 
 detect_service_manager() {
+    if [[ -n "${COMMON_SVC_MANAGER:-}" ]] && [[ "${COMMON_SVC_MANAGER}" != "unknown" ]]; then
+        echo "${COMMON_SVC_MANAGER}"
+        return 0
+    fi
     if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
         echo "systemd"
     elif command -v rc-service &>/dev/null && [[ -d /run/openrc ]]; then
         echo "openrc"
+    elif [[ "$(uname -s)" == "Darwin" ]] && command -v launchctl &>/dev/null; then
+        echo "launchctl"
     elif command -v service &>/dev/null; then
         echo "sysvinit"
     else

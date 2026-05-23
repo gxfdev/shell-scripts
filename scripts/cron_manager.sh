@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  定时任务管理脚本 (Cron Manager Script)
-#  支持: CentOS/RHEL, Ubuntu/Debian, Alpine, Arch Linux, openSUSE
-#  版本: 2.0.0
+#  支持: Linux (CentOS/Ubuntu/Debian/Alpine/Arch/openSUSE), macOS, Windows WSL/Git Bash
+#  版本: 2.1.0
 #  作者: gxfdev
 #  仓库: https://github.com/gxfdev/shell-scripts
 # ============================================================================
@@ -21,9 +21,18 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="cron_manager"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "${SCRIPT_DIR}")/lib"
+
+if [[ -f "${LIB_DIR}/common_lib.sh" ]]; then
+    source "${LIB_DIR}/common_lib.sh"
+    common_init
+else
+    echo "[WARN] common_lib.sh not found in ${LIB_DIR}, using fallback" >&2
+fi
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="/var/log/cron_manager"
 LOG_FILE="${LOG_DIR}/cron_manager_${TIMESTAMP}.log"
@@ -43,9 +52,11 @@ NOTIFY_ON_FAIL=0
 NOTIFY_WEBHOOK=""
 SYSTEMD_MODE=0
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
-WHITE='\033[1;37m'; NC='\033[0m'; DIM='\033[2m'
+if [[ -z "${RED:-}" ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
+    WHITE='\033[1;37m'; NC='\033[0m'; DIM='\033[2m'
+fi
 
 log() {
     local level="$1"; shift; local message="$*"
